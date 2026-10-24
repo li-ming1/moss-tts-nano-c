@@ -41,11 +41,15 @@
  *    - 关闭 ORT 自旋等待              混合架构 CPU 上避免线程被调度到能效核
  *    - 流式 codec 解码 (固定 13MB 缓存) 长音频内存 6.7GB -> 1.3GB
  *    - 边生成边解码                    省掉整体解码那一遍
+ *    - --play / --server 流式播放     首字 ~1.1s 出声, 之后生成追着播放跑
+ *    - --server 常驻                  模型只加载一次 (省 ~7.6s), 行协议换音色/种子
  * ==========================================================================*/
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
+#include <mmsystem.h>      /* waveOut 流式播放 */
+#include <io.h>            /* _isatty (server 模式判断交互终端) */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -108,6 +112,16 @@ static char* w2u(const wchar_t* w)
     if (n <= 0) return NULL;
     char* b = (char*)xmalloc((size_t)n);
     WideCharToMultiByte(CP_UTF8, 0, w, -1, b, n, NULL, NULL);
+    return b;
+}
+
+/* server 模式从 stdin 收到的是 UTF-8 字节行, 命令参数要转回宽字符 */
+static wchar_t* u2w(const char* s)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t* b = (wchar_t*)xmalloc(sizeof(wchar_t) * (size_t)n);
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, b, n);
     return b;
 }
 
@@ -1266,6 +1280,9 @@ typedef struct {
     size_t    n_samples;               /* 每声道采样点数 */
     size_t    cap;
     double    last_energy;             /* 最近一批的均方能量 */
+    /* 每批音频解码完成后的回调 (流式播放挂在这里), silent = 该批为静音 */
+    void    (*cb)(void* ctx, const float* interleaved, size_t n, int silent);
+    void*     cb_ctx;
 } StreamDec;
 
 static void sd_free(StreamDec* sd)
@@ -1373,6 +1390,7 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
     }
     sd->last_energy = acc / (double)(tail * CHANNELS);
     sd_append(sd, inter, per);
+    if (sd->cb) sd->cb(sd->cb_ctx, inter, per, sd->last_energy < 1.0e-5);
     free(inter);
 
     /* 状态交替换入: 输出直接作为下一次的输入 */
@@ -1398,13 +1416,165 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
     free(ac);
 }
 
+/* ---------------------------------------------------------------------------
+ * 流式播放 (waveOut)
+ *
+ * 合成比实时快 (RTF<1), 边生成边把每批音频 (约 1.28s) 推给声卡; 8 块环形
+ * 缓冲约 4 秒, 播放进度反过来给生成背压。静音批次先扣住 (hold) 不播:
+ * 后续有声批次到来时按原顺序补播 —— 句中停顿照常保留, 而结尾那段模型吐出
+ * 的多余静音在请求结束时整体丢弃, 与文件输出的尾部裁剪行为一致。
+ * -------------------------------------------------------------------------*/
+#define PL_NBUF     8
+#define PL_BUF_SMPL (SAMPLE_RATE / 2)     /* 每块 0.5s */
+
+typedef struct {
+    HWAVEOUT ho;
+    WAVEHDR  hdr[PL_NBUF];
+    int16_t* buf[PL_NBUF];
+    int      used[PL_NBUF];
+    float*   hold;                        /* 扣住的静音批次 */
+    size_t   hold_n, hold_cap;
+    int      live;
+    uint64_t t_start, t_first;            /* 请求开始 / 首批音频出声时刻 */
+    size_t   pushed;
+} Player;
+
+static void player_open(Player* p, int allow_device)
+{
+    memset(p, 0, sizeof(*p));
+    if (!allow_device) return;      /* --no-play: 只走回调计时, 不碰声卡 */
+    WAVEFORMATEX wf;
+    wf.wFormatTag = WAVE_FORMAT_PCM;
+    wf.nChannels = CHANNELS;
+    wf.nSamplesPerSec = SAMPLE_RATE;
+    wf.wBitsPerSample = 16;
+    wf.nBlockAlign = (WORD)(wf.nChannels * wf.wBitsPerSample / 8);
+    wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+    wf.cbSize = 0;
+    if (waveOutOpen(&p->ho, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        p->ho = NULL;
+        fprintf(stderr, "[warn] 打不开音频设备, 只合成不播放\n");
+        return;
+    }
+    for (int i = 0; i < PL_NBUF; i++)
+        p->buf[i] = (int16_t*)xmalloc(sizeof(int16_t) * PL_BUF_SMPL * CHANNELS);
+    p->live = 1;
+}
+
+static void player_close(Player* p)
+{
+    if (!p->live) return;
+    /* 等排队的音频播完再关 (上限 15s), 避免尾巴被掐掉 */
+    for (int t = 0; t < 1500; t++) {
+        int busy = 0;
+        for (int i = 0; i < PL_NBUF; i++)
+            if (p->hdr[i].dwFlags & WHDR_INQUEUE) { busy = 1; break; }
+        if (!busy) break;
+        Sleep(10);
+    }
+    waveOutReset(p->ho);
+    for (int i = 0; i < PL_NBUF; i++) {
+        if (p->used[i]) waveOutUnprepareHeader(p->ho, &p->hdr[i], sizeof(WAVEHDR));
+        free(p->buf[i]);
+    }
+    waveOutClose(p->ho);
+    free(p->hold);
+    p->live = 0;
+}
+
+static void player_begin(Player* p)
+{
+    p->t_start = now_ms();
+    p->pushed = 0;
+    p->hold_n = 0;
+}
+
+/* 新请求边界: 重置首字时刻统计 (t_first 在 emit 时置位, 一次请求内跨 chunk 保持) */
+static void player_request(Player* p)
+{
+    p->t_first = 0;
+}
+
+/* 把一段音频塞进空闲块提交给声卡; 没有空闲块就等播放消费 (背压) */
+static void player_emit(Player* p, const float* inter, size_t n)
+{
+    size_t off = 0;
+    while (off < n) {
+        size_t take = n - off;
+        if (take > PL_BUF_SMPL) take = PL_BUF_SMPL;
+        int i;
+        for (;;) {
+            for (i = 0; i < PL_NBUF; i++)
+                if (!p->used[i] || (p->hdr[i].dwFlags & WHDR_DONE)) break;
+            if (i < PL_NBUF) break;
+            Sleep(5);
+        }
+        if (p->used[i])
+            waveOutUnprepareHeader(p->ho, &p->hdr[i], sizeof(WAVEHDR));
+
+        int16_t* dst = p->buf[i];
+        const float* src = inter + off * CHANNELS;
+        for (size_t s = 0; s < take * CHANNELS; s++) {
+            float v = src[s] * 32767.0f;
+            dst[s] = (int16_t)(v >= 32767.0f ? 32767 : v <= -32768.0f ? -32768 : v);
+        }
+        memset(&p->hdr[i], 0, sizeof(WAVEHDR));
+        p->hdr[i].lpData = (LPSTR)dst;
+        p->hdr[i].dwBufferLength = (DWORD)(take * CHANNELS * sizeof(int16_t));
+        waveOutPrepareHeader(p->ho, &p->hdr[i], sizeof(WAVEHDR));
+        waveOutWrite(p->ho, &p->hdr[i], sizeof(WAVEHDR));
+        p->used[i] = 1;
+        off += take;
+    }
+    p->pushed += n;
+}
+
+static void player_push(Player* p, const float* inter, size_t n, int silent)
+{
+    if (n == 0) return;
+    if (silent) {
+        if (!p->live) return;
+        if (p->hold_n + n > p->hold_cap) {
+            size_t nc = p->hold_cap ? p->hold_cap : 65536;
+            while (nc < p->hold_n + n) nc *= 2;
+            float* b = (float*)realloc(p->hold, sizeof(float) * nc * CHANNELS);
+            if (!b) die("out of memory");
+            p->hold = b;
+            p->hold_cap = nc;
+        }
+        memcpy(p->hold + p->hold_n * CHANNELS, inter, sizeof(float) * n * CHANNELS);
+        p->hold_n += n;
+        return;
+    }
+    /* 首个有声批次就绪的时刻 = 首字延迟 (与有没有音频设备无关) */
+    if (!p->t_first) p->t_first = now_ms();
+    if (!p->live) return;
+    if (p->hold_n) {
+        player_emit(p, p->hold, p->hold_n);
+        p->hold_n = 0;
+    }
+    player_emit(p, inter, n);
+}
+
+static void player_on_audio(void* ctx, const float* inter, size_t n, int silent)
+{
+    player_push((Player*)ctx, inter, n, silent);
+}
+
+/* 请求收尾: 丢弃扣住的尾部静音 (对应文件输出的尾部裁剪) */
+static void player_drop_hold(Player* p)
+{
+    p->hold_n = 0;
+}
+
 /* 生成语音: 帧生成与 codec 解码交错进行, 音频直接累积到 out_pcm
  * 返回生成的帧数 */
 static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
                               const int16_t* ref, size_t ref_frames,
                               float** out_pcm, size_t* out_samples,
                               uint64_t seed, int max_frames,
-                              int verbose, int use_eos, const wchar_t* dump_frames)
+                              int verbose, int use_eos, const wchar_t* dump_frames,
+                              Player* pl)
 {
     size_t S = (size_t)12 + 1 + ref_frames + 1 + 56 + n_text + 6 + 1;
 
@@ -1511,6 +1681,11 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
 
     StreamDec sd;
     sd_init(&sd);
+    if (pl) {
+        sd.cb = player_on_audio;
+        sd.cb_ctx = pl;
+        player_begin(pl);
+    }
 
     /* 待解码的帧: 攒够 SD_BATCH 帧一起解码 (太小调度开销大, 太大峰值内存高) */
     enum { SD_BATCH = MOSS_SD_BATCH };
@@ -1617,6 +1792,7 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
         g_stats.probe += now_ms() - _tp;
         n_pend = 0;
     }
+    if (pl) player_drop_hold(pl);
 
     if (dump_frames && dump_frames[0]) {
         FILE* df = _wfopen(dump_frames, L"w");
@@ -2124,235 +2300,70 @@ static size_t prep_reference(float* pcm, size_t frames)
 }
 
 /* ---------------------------------------------------------------------------
- * 9. main
+ * 8.5 合成主流程 (一次性模式与 --server 共用)
  * -------------------------------------------------------------------------*/
-/* 崩溃时打印出错模块, 方便定位 (ONNX Runtime 内部崩溃时很有用) */
-static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep)
+
+/* 按名字解析音色 -> 参考码。成功返回 0: *ref 指向内嵌静态数据或 *owned 的
+ * 堆内存 (调用方负责 free(*owned)); 找不到返回 -1 (已打印原因)。 */
+static int resolve_voice(const wchar_t* manifest_path, const wchar_t* name_w,
+                         const int16_t** ref, size_t* ref_frames, int16_t** owned)
 {
-    void* addr = (void*)ep->ExceptionRecord->ExceptionAddress;
-    HMODULE mod = NULL;
-    char name[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)addr, &mod) && mod)
-        GetModuleFileNameA(mod, name, MAX_PATH);
-    fprintf(stderr, "[crash] code=0x%08lX addr=%p module=%s\n",
-            (unsigned long)ep->ExceptionRecord->ExceptionCode, addr, name);
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-static void usage(void)
-{
-    printf(
-        "MOSS-TTS-Nano 单文件 C 推理\n"
-        "\n"
-        "用法: moss_tts [文本] [选项]\n"
-        "\n"
-        "  --out <file>        输出 wav (默认 out.wav)\n"
-        "  --model-dir <dir>   模型目录 (默认 models)\n"
-        "  --voice <name>      内置音色 (默认 神里绫华, 见 --list-voices)\n"
-        "  --ref-wav <file>    用自己的参考音频克隆音色 (优先于 --voice)\n"
-        "  --save-voice <name> 把 --ref-wav 编出的参考码存进 manifest, 变成内置音色\n"
-        "  --voice-desc <txt>  新音色的描述 (配合 --save-voice, 默认用名字)\n"
-        "  --list-voices       列出 manifest 里的全部内置音色\n"
-        "  --seed <n>          随机种子 (默认 1234)\n"
-        "  --max-frames <n>    单块最大帧数 (默认 375, 12.5 帧/秒)\n"
-        "  --threads <n>       ONNX 线程数 (默认 4, 实测再多反而更慢)\n"
-        "  --tokens            只打印分词结果\n"
-        "  --verbose           打印生成过程\n"
-        "  --no-eos            关闭 token 重复检测 (只依赖能量判据)\n"
-        "  --dump-frames <f>   把生成的帧 token 导出成文本 (调试用)\n"
-        "  -h, --help          帮助\n");
-}
+    *owned = NULL;
+    if (!name_w || !name_w[0]) return -1;
+    char* u8 = w2u(name_w);
+    if (!u8) return -1;
 
-int wmain(int argc, wchar_t** argv)
-{
-    SetConsoleOutputCP(CP_UTF8);
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
-    SetUnhandledExceptionFilter(crash_filter);
-
-    char* text = NULL;
-    wchar_t out_path[MAX_PATH] = L"out.wav";
-    wchar_t model_dir[MAX_PATH] = L"models";
-    wchar_t ref_wav[MAX_PATH] = L"";
-    wchar_t save_voice[MAX_PATH] = L"";
-    wchar_t voice_desc[MAX_PATH] = L"";
-    uint64_t seed = 1234;
-    int max_frames = MAX_FRAMES_DEF;
-    int tokens_only = 0, verbose = 0, no_eos = 0, list_voices = 0;
-    const wchar_t* voice_w = L"神里绫华";   /* 默认音色: 用户克隆的音色 */
-    wchar_t dump_frames[MAX_PATH] = L"";
-    int threads = 0;
-
-    /* 文本: 拼接所有非选项参数 */
-    {
-        size_t cap = 4096, used = 0;
-        text = (char*)xcalloc(cap, 1);
-        for (int i = 1; i < argc; i++) {
-            const wchar_t* a = argv[i];
-            if (a[0] == L'-') {
-                if (!wcscmp(a, L"--out") && i + 1 < argc) { wcscpy(out_path, argv[++i]); }
-                else if (!wcscmp(a, L"--model-dir") && i + 1 < argc) { wcscpy(model_dir, argv[++i]); }
-                else if (!wcscmp(a, L"--ref-wav") && i + 1 < argc) { wcscpy(ref_wav, argv[++i]); }
-                else if (!wcscmp(a, L"--save-voice") && i + 1 < argc) { wcscpy(save_voice, argv[++i]); }
-                else if (!wcscmp(a, L"--voice-desc") && i + 1 < argc) { wcscpy(voice_desc, argv[++i]); }
-                else if (!wcscmp(a, L"--voice") && i + 1 < argc) { voice_w = argv[++i]; }
-                else if (!wcscmp(a, L"--list-voices")) { list_voices = 1; }
-                else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
-                else if (!wcscmp(a, L"--max-frames") && i + 1 < argc) { max_frames = _wtoi(argv[++i]); }
-                else if (!wcscmp(a, L"--threads") && i + 1 < argc) { threads = _wtoi(argv[++i]); }
-                else if (!wcscmp(a, L"--tokens")) { tokens_only = 1; }
-                else if (!wcscmp(a, L"--verbose")) { verbose = 1; }
-                else if (!wcscmp(a, L"--no-eos")) { no_eos = 1; }
-                else if (!wcscmp(a, L"--dump-frames") && i + 1 < argc) { wcscpy(dump_frames, argv[++i]); }
-                else if (!wcscmp(a, L"-h") || !wcscmp(a, L"--help")) { usage(); return 0; }
-                else {
-                    char* u = w2u(a);
-                    fprintf(stderr, "unknown option: %s\n", u ? u : "?");
-                    free(u);
-                    return 2;
-                }
-                continue;
-            }
-            char* u = w2u(a);
-            size_t ul = strlen(u);
-            if (used + ul + 2 > cap) {
-                cap = (used + ul + 2) * 2;
-                text = (char*)realloc(text, cap);
-                if (!text) die("out of memory");
-            }
-            if (used) text[used++] = ' ';
-            memcpy(text + used, u, ul);
-            used += ul;
-            text[used] = 0;
-            free(u);
-        }
-    }
-    if (text[0] == 0) {
-        free(text);
-        text = _strdup("\xE6\xAC\xA2\xE8\xBF\x8E\xE5\x85\xB3\xE6\xB3\xA8\xE6\xA8\xA1\xE6\x80\x9D"
-                       "\xE6\x99\xBA\xE8\x83\xBD\xEF\xBC\x8C\xE8\xBF\x99\xE6\x98\xAF MOSS-TTS-Nano "
-                       "\xE7\x9A\x84\xE7\xBA\xAF C \xE6\x8E\xA8\xE7\x90\x86\xE5\xAE\x9E\xE7\x8E\xB0\xE3\x80\x82");
-    }
-
-    if (threads <= 0) {
-        /* 实测: 这个 100M 模型在 4 线程附近最快; 线程开太多 (8/16) 会因为
-         * ORT 自旋等待 + 线程争抢而慢 3~5 倍。 */
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        threads = (int)si.dwNumberOfProcessors;
-        if (threads <= 0) threads = 4;
-        if (threads > 4) threads = 4;
-    }
-
-    /* ---- 分词器 ---- */
-    wchar_t tok_path[MAX_PATH * 2];
-    _snwprintf(tok_path, MAX_PATH * 2, L"%s\\tokenizer.model", model_dir);
-
-    uint64_t t0 = now_ms();
-    SP sp;
-    sp_load(&sp, tok_path);
-
-    char* norm = normalize_for_tts(text);
-    printf("text      : %s\n", norm);
-
-    if (tokens_only) {
-        int32_t* ids = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(norm) * 2 + 16));
-        int n = sp_encode(&sp, norm, ids, (int)strlen(norm) * 2 + 16);
-        printf("tokens(%d): [", n);
-        for (int k = 0; k < n; k++) printf("%s%d", k ? ", " : "", ids[k]);
-        printf("]\n");
-        free(ids); free(norm); free(text);
-        return 0;
-    }
-
-    /* ---- 音色 / 参考音频 ---- */
-    wchar_t manifest_path[MAX_PATH * 2];
-    _snwprintf(manifest_path, MAX_PATH * 2, L"%s\\browser_poc_manifest.json", model_dir);
-    if (save_voice[0] && !ref_wav[0])
-        die("--save-voice 需要配合 --ref-wav: 先用参考音频编出参考码才能保存");
-
-    if (list_voices) {
-        printf("内置音色 (来自 %ls):\n", manifest_path);
-        if (!manifest_list_voices(manifest_path))
-            fprintf(stderr, "  (读不到 manifest, 只有内嵌的 神里绫华 可用)\n");
-        free(norm); free(text);
-        return 0;
-    }
-
-    const int16_t* ref = k_ref_codes_ayaka;
-    size_t ref_frames = REF_FRAMES_AYAKA;
-    char* voice_u8 = w2u(voice_w);
-
-    Models models;
-    models_open(&models, model_dir, threads);
-
-    int16_t* ref_owned = NULL;
-    if (ref_wav[0]) {
-        size_t nfr = 0;
-        float* wav = wav_read_48k_stereo(ref_wav, &nfr);
-        if (!wav) die("cannot read --ref-wav (需要 WAV: 16/24/32-bit PCM 或 float32)");
-        nfr = prep_reference(wav, nfr);
-        if (nfr < (size_t)(SAMPLE_RATE / 2)) die("--ref-wav 有效音频太短 (至少 0.5 秒)");
-        /* 参考音频越长, prompt 越长, 每帧注意力越慢。15 秒足够克隆音色了。 */
-        if (nfr > (size_t)SAMPLE_RATE * 15) {
-            nfr = (size_t)SAMPLE_RATE * 15;
-            fprintf(stderr, "  [note] 参考音频超过 15 秒, 只取前 15 秒\n");
-        }
-        ref_owned = codec_encode(&models, wav, nfr, &ref_frames);
-        free(wav);
-        ref = ref_owned;
-        printf("ref-wav   : %.2f s -> %zu 帧 (声音克隆)\n", (double)nfr / SAMPLE_RATE, ref_frames);
-        if (save_voice[0]) {
-            char* sv = w2u(save_voice);
-            char* sd = w2u(voice_desc[0] ? voice_desc : save_voice);
-            if (!manifest_save_voice(manifest_path, sv, sd, ref_wav, ref_owned, ref_frames))
-                printf("saved     : \"%s\" (%zu 帧) -> manifest, 之后可直接 --voice %s\n",
-                       sv, ref_frames, sv);
-            free(sv); free(sd);
-        }
-    } else if (voice_u8 && wcscmp(voice_w, L"神里绫华") == 0) {
+    if (wcscmp(name_w, L"神里绫华") == 0) {
         /* 默认音色: 优先用 manifest 里的 (参考可能更新过), 查不到退回内嵌的一份 */
-        ref_owned = manifest_voice(manifest_path, voice_u8, &ref_frames);
-        if (ref_owned) {
-            ref = ref_owned;
+        *owned = manifest_voice(manifest_path, u8, ref_frames);
+        if (*owned) {
+            *ref = *owned;
         } else {
+            *ref = k_ref_codes_ayaka;
+            *ref_frames = REF_FRAMES_AYAKA;
             fprintf(stderr, "  [note] manifest 缺失或没有默认音色, 用内嵌的神里绫华\n");
         }
-        printf("voice     : %s (%zu 帧)\n", voice_u8, ref_frames);
-    } else if (voice_u8) {
-        ref_owned = manifest_voice(manifest_path, voice_u8, &ref_frames);
-        if (!ref_owned) {
-            fprintf(stderr, "找不到音色 \"%s\", 用 --list-voices 看看有哪些\n", voice_u8);
-            exit(2);
+    } else {
+        *owned = manifest_voice(manifest_path, u8, ref_frames);
+        if (!*owned) {
+            fprintf(stderr, "找不到音色 \"%s\", 用 --list-voices 看看有哪些\n", u8);
+            free(u8);
+            return -1;
         }
-        ref = ref_owned;
-        printf("voice     : %s (%zu 帧)\n", voice_u8, ref_frames);
+        *ref = *owned;
     }
-    free(voice_u8);
-    printf("threads   : %d\n", threads);
-    if (verbose) {
-        size_t priv = 0, ws = cur_working_set(&priv);
-        fprintf(stderr, "  [mem] 模型加载后 working set %.0f MB, private %.0f MB\n",
-                (double)ws / 1048576.0, (double)priv / 1048576.0);
-    }
+    printf("voice     : %s (%zu 帧)\n", u8, *ref_frames);
+    free(u8);
+    return 0;
+}
 
-    /* ---- 分块合成 ---- */
+/* 分块合成一段已归一化的文本: 逐块 generate (可选流式播放), 拼接后做
+ * 尾部裁剪 + 峰值归一化, 返回整段音频 (调用方 free); *out_total 为采样数。
+ * 没生成出任何音频返回 NULL。 */
+static float* synthesize(Models* m, SP* sp, const char* norm,
+                         const int16_t* ref, size_t ref_frames,
+                         uint64_t seed, int max_frames,
+                         int verbose, int use_eos, const wchar_t* dump_frames,
+                         Player* pl, size_t* out_total)
+{
     char** chunks = NULL;
-    int nch = split_chunks(&sp, norm, &chunks, MAX_TEXT_TOKENS);
+    int nch = split_chunks(sp, norm, &chunks, MAX_TEXT_TOKENS);
 
     size_t total_samples = 0;
     float* all = NULL;
 
     for (int ci = 0; ci < nch; ci++) {
         int32_t* tids = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(chunks[ci]) * 2 + 16));
-        int nt = sp_encode(&sp, chunks[ci], tids, (int)strlen(chunks[ci]) * 2 + 16);
+        int nt = sp_encode(sp, chunks[ci], tids, (int)strlen(chunks[ci]) * 2 + 16);
         if (nt <= 0) { free(tids); continue; }
         if (verbose || nch > 1) printf("chunk %d/%d: %d tokens\n", ci + 1, nch, nt);
 
         uint64_t t1 = now_ms();
         float* pcm = NULL;
         size_t nsamp = 0;
-        size_t frames = generate_frames(&models, tids, (size_t)nt, ref, ref_frames,
-                                        &pcm, &nsamp, seed, max_frames, verbose, !no_eos, dump_frames);
+        size_t frames = generate_frames(m, tids, (size_t)nt, ref, ref_frames,
+                                        &pcm, &nsamp, seed, max_frames, verbose, use_eos,
+                                        dump_frames, pl);
         uint64_t t2 = now_ms();
         if (frames == 0 || !pcm || nsamp == 0) {
             fprintf(stderr, "  [warn] no frames generated for this chunk\n");
@@ -2383,7 +2394,7 @@ int wmain(int argc, wchar_t** argv)
     for (int k = 0; k < nch; k++) free(chunks[k]);
     free(chunks);
 
-    if (!all || total_samples == 0) die("nothing generated");
+    if (!all || total_samples == 0) return NULL;
 
     /* 模型说完之后还会继续吐一段静音 (偶尔夹杂稀疏的脉冲), 把末尾多余的部分裁掉。
      * 用 20ms 窗口的 RMS 判断而不是单点幅值, 免得被孤立脉冲带偏。 */
@@ -2418,16 +2429,316 @@ int wmain(int argc, wchar_t** argv)
         }
     }
 
-    wav_write_stereo(out_path, all, total_samples, CHANNELS, SAMPLE_RATE);
+    *out_total = total_samples;
+    return all;
+}
 
-    uint64_t t4 = now_ms();
-    char* op = w2u(out_path);
-    printf("\nwrote %s : %.2f s @ %d Hz stereo\n", op ? op : "?", (double)total_samples / SAMPLE_RATE, SAMPLE_RATE);
-    printf("total     : %llu ms\n", (unsigned long long)(t4 - t0));
+/* ---------------------------------------------------------------------------
+ * 9. main
+ * -------------------------------------------------------------------------*/
+/* 崩溃时打印出错模块, 方便定位 (ONNX Runtime 内部崩溃时很有用) */
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep)
+{
+    void* addr = (void*)ep->ExceptionRecord->ExceptionAddress;
+    HMODULE mod = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)addr, &mod) && mod)
+        GetModuleFileNameA(mod, name, MAX_PATH);
+    fprintf(stderr, "[crash] code=0x%08lX addr=%p module=%s\n",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode, addr, name);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static void usage(void)
+{
+    printf(
+        "MOSS-TTS-Nano 单文件 C 推理\n"
+        "\n"
+        "用法: moss_tts [文本] [选项]\n"
+        "\n"
+        "  --out <file>        输出 wav (默认 out.wav)\n"
+        "  --model-dir <dir>   模型目录 (默认 models)\n"
+        "  --voice <name>      内置音色 (默认 神里绫华, 见 --list-voices)\n"
+        "  --ref-wav <file>    用自己的参考音频克隆音色 (优先于 --voice)\n"
+        "  --save-voice <name> 把 --ref-wav 编出的参考码存进 manifest, 变成内置音色\n"
+        "  --voice-desc <txt>  新音色的描述 (配合 --save-voice, 默认用名字)\n"
+        "  --list-voices       列出 manifest 里的全部内置音色\n"
+        "  --play              边生成边播放 (RTF<1, 流式不卡顿)\n"
+        "  --server            常驻模式: 每行一段文本, 模型只加载一次 (含 --play)\n"
+        "  --no-play           配合 --server: 只合成不播放\n"
+        "  --seed <n>          随机种子 (默认 1234)\n"
+        "  --max-frames <n>    单块最大帧数 (默认 375, 12.5 帧/秒)\n"
+        "  --threads <n>       ONNX 线程数 (默认 4, 实测再多反而更慢)\n"
+        "  --tokens            只打印分词结果\n"
+        "  --verbose           打印生成过程\n"
+        "  --no-eos            关闭 token 重复检测 (只依赖能量判据)\n"
+        "  --dump-frames <f>   把生成的帧 token 导出成文本 (调试用)\n"
+        "  -h, --help          帮助\n");
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    SetConsoleOutputCP(CP_UTF8);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    SetUnhandledExceptionFilter(crash_filter);
+
+    char* text = NULL;
+    wchar_t out_path[MAX_PATH] = L"out.wav";
+    wchar_t model_dir[MAX_PATH] = L"models";
+    wchar_t ref_wav[MAX_PATH] = L"";
+    wchar_t save_voice[MAX_PATH] = L"";
+    wchar_t voice_desc[MAX_PATH] = L"";
+    uint64_t seed = 1234;
+    int max_frames = MAX_FRAMES_DEF;
+    int tokens_only = 0, verbose = 0, no_eos = 0, list_voices = 0;
+    int play = 0, server = 0, no_play = 0, out_given = 0;
+    const wchar_t* voice_w = L"神里绫华";   /* 默认音色: 用户克隆的音色 */
+    wchar_t dump_frames[MAX_PATH] = L"";
+    int threads = 0;
+
+    /* 文本: 拼接所有非选项参数 */
+    {
+        size_t cap = 4096, used = 0;
+        text = (char*)xcalloc(cap, 1);
+        for (int i = 1; i < argc; i++) {
+            const wchar_t* a = argv[i];
+            if (a[0] == L'-') {
+                if (!wcscmp(a, L"--out") && i + 1 < argc) { wcscpy(out_path, argv[++i]); out_given = 1; }
+                else if (!wcscmp(a, L"--model-dir") && i + 1 < argc) { wcscpy(model_dir, argv[++i]); }
+                else if (!wcscmp(a, L"--ref-wav") && i + 1 < argc) { wcscpy(ref_wav, argv[++i]); }
+                else if (!wcscmp(a, L"--save-voice") && i + 1 < argc) { wcscpy(save_voice, argv[++i]); }
+                else if (!wcscmp(a, L"--voice-desc") && i + 1 < argc) { wcscpy(voice_desc, argv[++i]); }
+                else if (!wcscmp(a, L"--voice") && i + 1 < argc) { voice_w = argv[++i]; }
+                else if (!wcscmp(a, L"--list-voices")) { list_voices = 1; }
+                else if (!wcscmp(a, L"--play")) { play = 1; }
+                else if (!wcscmp(a, L"--server")) { server = 1; }
+                else if (!wcscmp(a, L"--no-play")) { no_play = 1; }
+                else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
+                else if (!wcscmp(a, L"--max-frames") && i + 1 < argc) { max_frames = _wtoi(argv[++i]); }
+                else if (!wcscmp(a, L"--threads") && i + 1 < argc) { threads = _wtoi(argv[++i]); }
+                else if (!wcscmp(a, L"--tokens")) { tokens_only = 1; }
+                else if (!wcscmp(a, L"--verbose")) { verbose = 1; }
+                else if (!wcscmp(a, L"--no-eos")) { no_eos = 1; }
+                else if (!wcscmp(a, L"--dump-frames") && i + 1 < argc) { wcscpy(dump_frames, argv[++i]); }
+                else if (!wcscmp(a, L"-h") || !wcscmp(a, L"--help")) { usage(); return 0; }
+                else {
+                    char* u = w2u(a);
+                    fprintf(stderr, "unknown option: %s\n", u ? u : "?");
+                    free(u);
+                    return 2;
+                }
+                continue;
+            }
+            char* u = w2u(a);
+            size_t ul = strlen(u);
+            if (used + ul + 2 > cap) {
+                cap = (used + ul + 2) * 2;
+                text = (char*)realloc(text, cap);
+                if (!text) die("out of memory");
+            }
+            if (used) text[used++] = ' ';
+            memcpy(text + used, u, ul);
+            used += ul;
+            text[used] = 0;
+            free(u);
+        }
+    }
+    if (text[0] == 0 && !server) {
+        free(text);
+        text = _strdup("\xE6\xAC\xA2\xE8\xBF\x8E\xE5\x85\xB3\xE6\xB3\xA8\xE6\xA8\xA1\xE6\x80\x9D"
+                       "\xE6\x99\xBA\xE8\x83\xBD\xEF\xBC\x8C\xE8\xBF\x99\xE6\x98\xAF MOSS-TTS-Nano "
+                       "\xE7\x9A\x84\xE7\xBA\xAF C \xE6\x8E\xA8\xE7\x90\x86\xE5\xAE\x9E\xE7\x8E\xB0\xE3\x80\x82");
+    }
+
+    if (threads <= 0) {
+        /* 实测: 这个 100M 模型在 4 线程附近最快; 线程开太多 (8/16) 会因为
+         * ORT 自旋等待 + 线程争抢而慢 3~5 倍。 */
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        threads = (int)si.dwNumberOfProcessors;
+        if (threads <= 0) threads = 4;
+        if (threads > 4) threads = 4;
+    }
+
+    /* ---- 分词器 ---- */
+    wchar_t tok_path[MAX_PATH * 2];
+    _snwprintf(tok_path, MAX_PATH * 2, L"%s\\tokenizer.model", model_dir);
+
+    uint64_t t0 = now_ms();
+    SP sp;
+    sp_load(&sp, tok_path);
+
+    char* norm = normalize_for_tts(text);
+    if (!server) printf("text      : %s\n", norm);
+
+    if (tokens_only) {
+        int32_t* ids = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(norm) * 2 + 16));
+        int n = sp_encode(&sp, norm, ids, (int)strlen(norm) * 2 + 16);
+        printf("tokens(%d): [", n);
+        for (int k = 0; k < n; k++) printf("%s%d", k ? ", " : "", ids[k]);
+        printf("]\n");
+        free(ids); free(norm); free(text);
+        return 0;
+    }
+
+    /* ---- 音色 / 参考音频 ---- */
+    wchar_t manifest_path[MAX_PATH * 2];
+    _snwprintf(manifest_path, MAX_PATH * 2, L"%s\\browser_poc_manifest.json", model_dir);
+    if (save_voice[0] && !ref_wav[0])
+        die("--save-voice 需要配合 --ref-wav: 先用参考音频编出参考码才能保存");
+
+    if (list_voices) {
+        printf("内置音色 (来自 %ls):\n", manifest_path);
+        if (!manifest_list_voices(manifest_path))
+            fprintf(stderr, "  (读不到 manifest, 只有内嵌的 神里绫华 可用)\n");
+        free(norm); free(text);
+        return 0;
+    }
+
+    const int16_t* ref = k_ref_codes_ayaka;
+    size_t ref_frames = REF_FRAMES_AYAKA;
+
+    Models models;
+    models_open(&models, model_dir, threads);
+
+    int16_t* ref_owned = NULL;
+    if (ref_wav[0]) {
+        size_t nfr = 0;
+        float* wav = wav_read_48k_stereo(ref_wav, &nfr);
+        if (!wav) die("cannot read --ref-wav (需要 WAV: 16/24/32-bit PCM 或 float32)");
+        nfr = prep_reference(wav, nfr);
+        if (nfr < (size_t)(SAMPLE_RATE / 2)) die("--ref-wav 有效音频太短 (至少 0.5 秒)");
+        /* 参考音频越长, prompt 越长, 每帧注意力越慢。15 秒足够克隆音色了。 */
+        if (nfr > (size_t)SAMPLE_RATE * 15) {
+            nfr = (size_t)SAMPLE_RATE * 15;
+            fprintf(stderr, "  [note] 参考音频超过 15 秒, 只取前 15 秒\n");
+        }
+        ref_owned = codec_encode(&models, wav, nfr, &ref_frames);
+        free(wav);
+        ref = ref_owned;
+        printf("ref-wav   : %.2f s -> %zu 帧 (声音克隆)\n", (double)nfr / SAMPLE_RATE, ref_frames);
+        if (save_voice[0]) {
+            char* sv = w2u(save_voice);
+            char* sd = w2u(voice_desc[0] ? voice_desc : save_voice);
+            if (!manifest_save_voice(manifest_path, sv, sd, ref_wav, ref_owned, ref_frames))
+                printf("saved     : \"%s\" (%zu 帧) -> manifest, 之后可直接 --voice %s\n",
+                       sv, ref_frames, sv);
+            free(sv); free(sd);
+        }
+    } else {
+        if (resolve_voice(manifest_path, voice_w, &ref, &ref_frames, &ref_owned) != 0)
+            exit(2);
+    }
+    printf("threads   : %d\n", threads);
+    if (verbose) {
+        size_t priv = 0, ws = cur_working_set(&priv);
+        fprintf(stderr, "  [mem] 模型加载后 working set %.0f MB, private %.0f MB\n",
+                (double)ws / 1048576.0, (double)priv / 1048576.0);
+    }
+
+    /* ---- 流式播放器 + 合成 ---- */
+    Player player;
+    memset(&player, 0, sizeof(player));
+    int use_player = (play || server);
+    if (use_player) player_open(&player, !no_play);
+    Player* pl = use_player ? &player : NULL;
+
+    if (server) {
+        /* 常驻模式: 模型只加载一次, 每行一段文本; 热启动后免掉 3s+ 的加载 */
+        SetConsoleCP(CP_UTF8);        /* 交互终端下让 stdin 按 UTF-8 收 */
+        SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+        printf("server    : 每行一段文本回车合成; /voice <名> 换音色, /seed <n> 换种子, /quit 退出\n");
+        char line[16384];
+        int req = 0;
+        int tty = _isatty(_fileno(stdin));
+        for (;;) {
+            if (tty) printf("\n> ");
+            if (!fgets(line, sizeof(line), stdin)) break;
+            size_t ll = strlen(line);
+            while (ll && (line[ll - 1] == '\n' || line[ll - 1] == '\r')) line[--ll] = 0;
+            if (!ll) continue;
+
+            if (line[0] == '/') {
+                if (!strncmp(line, "/quit", 5)) break;
+                if (!strncmp(line, "/voice", 6) && (line[6] == ' ' || line[6] == '\t')) {
+                    const char* vn = line + 6;
+                    while (*vn == ' ' || *vn == '\t') vn++;
+                    wchar_t* vw = u2w(vn);
+                    const int16_t* nref = NULL;
+                    size_t nfr = 0;
+                    int16_t* nown = NULL;
+                    if (vw && resolve_voice(manifest_path, vw, &nref, &nfr, &nown) == 0) {
+                        free(ref_owned);
+                        ref_owned = nown;
+                        ref = nref;
+                        ref_frames = nfr;
+                    }
+                    free(vw);
+                } else if (!strncmp(line, "/seed", 5) && (line[5] == ' ' || line[5] == '\t')) {
+                    seed = _strtoui64(line + 5, NULL, 10);
+                    printf("seed      : %llu\n", (unsigned long long)seed);
+                } else {
+                    fprintf(stderr, "未知命令: %s (可用: /voice <名> /seed <n> /quit)\n", line);
+                }
+                continue;
+            }
+
+            char* lnorm = normalize_for_tts(line);
+            printf("text      : %s\n", lnorm);
+            uint64_t rq = now_ms();
+            if (use_player) player_request(&player);
+            size_t tot = 0;
+            float* audio = synthesize(&models, &sp, lnorm, ref, ref_frames, seed,
+                                      max_frames, verbose, !no_eos, L"", pl, &tot);
+            req++;
+            if (audio) {
+                if (out_given) {
+                    /* out.wav -> out_001.wav, out_002.wav ... */
+                    wchar_t stem[MAX_PATH * 2], ext[32], cur[MAX_PATH * 2 + 32];
+                    wcscpy(stem, out_path);
+                    wchar_t* dot = wcsrchr(stem, L'.');
+                    if (dot) { wcsncpy(ext, dot, 31); ext[31] = 0; *dot = 0; }
+                    else wcscpy(ext, L".wav");
+                    _snwprintf(cur, MAX_PATH * 2 + 32, L"%s_%03d%s", stem, req, ext);
+                    wav_write_stereo(cur, audio, tot, CHANNELS, SAMPLE_RATE);
+                    char* cu = w2u(cur);
+                    printf("wrote     : %s\n", cu ? cu : "?");
+                    free(cu);
+                }
+                double as = (double)tot / SAMPLE_RATE;
+                double gs = (double)(now_ms() - rq) / 1000.0;
+                printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f\n",
+                       (unsigned long long)(player.t_first ? player.t_first - rq : 0),
+                       as, gs, as > 0.0 ? gs / as : 0.0);
+                free(audio);
+            } else {
+                fprintf(stderr, "  [warn] 没有生成音频\n");
+            }
+            free(lnorm);
+        }
+        printf("\nserver    : 共 %d 次请求, 退出\n", req);
+    } else {
+        size_t total_samples = 0;
+        float* all = synthesize(&models, &sp, norm, ref, ref_frames, seed,
+                                max_frames, verbose, !no_eos, dump_frames, pl, &total_samples);
+        if (!all) die("nothing generated");
+
+        wav_write_stereo(out_path, all, total_samples, CHANNELS, SAMPLE_RATE);
+
+        uint64_t t4 = now_ms();
+        char* op = w2u(out_path);
+        printf("\nwrote %s : %.2f s @ %d Hz stereo\n", op ? op : "?",
+               (double)total_samples / SAMPLE_RATE, SAMPLE_RATE);
+        printf("total     : %llu ms\n", (unsigned long long)(t4 - t0));
+        free(op);
+        free(all);
+    }
+
+    if (use_player) player_close(&player);
 
     g_stats.peak_rss = peak_working_set();
     if (verbose) {
-        uint64_t load_sum = g_stats.load_prefill + g_stats.load_decode + g_stats.load_frame +
+        size_t load_sum = g_stats.load_prefill + g_stats.load_decode + g_stats.load_frame +
                             g_stats.load_dec + g_stats.load_enc;
         fprintf(stderr, "\n--- 耗时明细 ---\n");
         fprintf(stderr, "  模型加载 : %5llu ms  (prefill %llu / decode %llu / frame %llu / codec-dec %llu / codec-enc %llu)\n",
@@ -2447,9 +2758,6 @@ int wmain(int argc, wchar_t** argv)
         fprintf(stderr, "  峰值内存 : %.1f MB (结束时 %.1f MB / private %.1f MB)\n",
                 (double)g_stats.peak_rss / 1048576.0, (double)ws2 / 1048576.0, (double)priv2 / 1048576.0);
     }
-    free(op);
-
-    free(all);
     free(ref_owned);
     free(norm);
     free(text);

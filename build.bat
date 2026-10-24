@@ -35,7 +35,7 @@ rem inside onnxruntime.
 cl /nologo /std:c11 /W3 /O2 /GL /MT /utf-8 /D_CRT_SECURE_NO_WARNINGS ^
     moss_tts.c ^
     /link /LTCG /OPT:REF /OPT:ICF /OUT:moss_tts.exe ^
-    kernel32.lib
+    kernel32.lib winmm.lib
 if errorlevel 1 exit /b 1
 del /q moss_tts.obj 2>nul
 
