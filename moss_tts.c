@@ -28,15 +28,24 @@
  *         v
  *    decode_step.onnx (输入上一步的 16 个 token) -> 新的 hidden + 新 KV
  *         |
- *         v   (循环直到 should_continue==0 或检测到语音结束)
- *    codec decode_full.onnx  ->  48kHz 立体声 PCM
+ *         v   (循环直到 should_continue==0 / 尾部静音 / 达到帧数上限)
+ *    codec decode_step.onnx (流式, 固定 KV 缓存)  ->  48kHz 立体声 PCM
  *         |
  *         v
  *    out.wav (16-bit PCM)
+ *
+ *  性能设计 (相对朴素实现的实测收益):
+ *    - 四个 session 并行加载          加载 13.0s -> 2.7s
+ *    - codec_encode 延迟到需要时再加载  省 4s / 44MB (只有 --ref-wav 才用)
+ *    - 输入张量复用 + 掩码增量更新     单帧 90ms -> 44ms
+ *    - 关闭 ORT 自旋等待              混合架构 CPU 上避免线程被调度到能效核
+ *    - 流式 codec 解码 (固定 13MB 缓存) 长音频内存 6.7GB -> 1.3GB
+ *    - 边生成边解码                    省掉整体解码那一遍
  * ==========================================================================*/
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,24 +248,65 @@ static void ort_load(void)
     OK(ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_meminfo));
 }
 
+/* 各阶段耗时 / 峰值内存, 供 --verbose 输出 */
+typedef struct {
+    uint64_t load_ort, load_prefill, load_decode, load_frame, load_dec, load_enc;
+    uint64_t prefill, frame, step, probe, decode;
+    int steps;
+    size_t peak_rss;
+} Stats;
+static Stats g_stats;
+
+static size_t cur_working_set(size_t* priv_out)
+{
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    pmc.cb = sizeof(pmc);
+    typedef BOOL (WINAPI * Fn)(HANDLE, PROCESS_MEMORY_COUNTERS_EX*, DWORD);
+    static Fn fn = NULL;
+    if (!fn) fn = (Fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
+    if (fn && fn(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        if (priv_out) *priv_out = (size_t)pmc.PrivateUsage;
+        return (size_t)pmc.WorkingSetSize;
+    }
+    return 0;
+}
+
+static size_t peak_working_set(void)
+{
+    PROCESS_MEMORY_COUNTERS pmc;
+    pmc.cb = sizeof(pmc);
+    typedef BOOL (WINAPI * Fn)(HANDLE, PROCESS_MEMORY_COUNTERS*, DWORD);
+    static Fn fn = NULL;
+    if (!fn) fn = (Fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
+    if (fn && fn(GetCurrentProcess(), &pmc, sizeof(pmc))) return (size_t)pmc.PeakWorkingSetSize;
+    return 0;
+}
+
 /* 一个 session + 输入输出名字表 */
 typedef struct {
     OrtSession* s;
     size_t n_in, n_out;
-    char in_name[32][48];
-    char out_name[32][48];
-    const char* in_ptr[32];
-    const char* out_ptr[32];
+    char in_name[64][48];
+    char out_name[64][48];
+    const char* in_ptr[64];
+    const char* out_ptr[64];
 } Session;
 
-static void sess_open(Session* S, const wchar_t* dir, const wchar_t* file, int threads)
+static void sess_open_ex(Session* S, const wchar_t* dir, const wchar_t* file, int threads,
+                         uint64_t* t_out, int no_arena)
 {
+    uint64_t t0 = now_ms();
     wchar_t path[MAX_PATH * 2];
     _snwprintf(path, MAX_PATH * 2, L"%s\\%s", dir, file);
 
     OrtSessionOptions* so = NULL;
     OK(ort->CreateSessionOptions(&so));
     OK(ort->SetIntraOpNumThreads(so, threads));
+    /* 关闭自旋等待: 这个模型每步的计算量很小, 自旋线程在混合架构 CPU 上会被
+     * 调度到能效核, 反而拖慢整体 (实测 8 线程: 开启自旋 33s, 关闭后 17.8s)。 */
+    OK(ort->AddSessionConfigEntry(so, "session.intra_op.allow_spinning", "0"));
+    if (no_arena & 1) OK(ort->DisableCpuMemArena(so));
+    if (no_arena & 2) OK(ort->DisableMemPattern(so));
     OK(ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
     OrtStatus* st = ort->CreateSession(g_env, path, so, &S->s);
     ort->ReleaseSessionOptions(so);
@@ -277,6 +327,12 @@ static void sess_open(Session* S, const wchar_t* dir, const wchar_t* file, int t
         OK(ort->SessionGetOutputCount(S->s, &n));
         S->n_out = n;
     }
+    if (t_out) *t_out = now_ms() - t0;
+}
+
+static void sess_open(Session* S, const wchar_t* dir, const wchar_t* file, int threads, uint64_t* t_out)
+{
+    sess_open_ex(S, dir, file, threads, t_out, 0);
 }
 
 static void sess_run(Session* S, OrtValue** ins, OrtValue** outs)
@@ -977,13 +1033,35 @@ static const int16_t k_ref_codes_junhao[1568] = {
 /* ---------------------------------------------------------------------------
  * 7. 推理
  * -------------------------------------------------------------------------*/
+#define SD_N_ATTN  12
+/* 各注意力层的上下文长度, 与 codec_browser_onnx_meta.json 的 streaming_decode 一致 */
+static const int k_sd_ctx[SD_N_ATTN] = { 500, 500, 500, 500, 800, 800, 1200, 1200, 1600, 1600, 1600, 1600 };
+
 typedef struct {
     Session prefill;
     Session decode;
     Session frame;
-    Session enc;      /* codec encode (可选, 声音克隆) */
+    Session enc;      /* codec encode: 只在 --ref-wav 时才加载 */
     Session dec;      /* codec decode_full */
+    wchar_t dir[MAX_PATH];
+    int threads;
 } Models;
+
+typedef struct {
+    Session* S;
+    const wchar_t* dir;
+    const wchar_t* file;
+    int threads;
+    uint64_t* t_out;
+    int no_arena;
+} LoadJob;
+
+static DWORD WINAPI load_worker(LPVOID p)
+{
+    LoadJob* j = (LoadJob*)p;
+    sess_open_ex(j->S, j->dir, j->file, j->threads, j->t_out, j->no_arena);
+    return 0;
+}
 
 static void models_open(Models* m, const wchar_t* dir, int threads)
 {
@@ -1034,14 +1112,34 @@ static void models_open(Models* m, const wchar_t* dir, int threads)
     strcpy(m->enc.out_name[0], "audio_codes");
     strcpy(m->enc.out_name[1], "audio_code_lengths");
 
-    m->dec.n_in = 2;
-    strcpy(m->dec.in_name[0], "audio_codes");
-    strcpy(m->dec.in_name[1], "audio_code_lengths");
-    m->dec.n_out = 2;
-    strcpy(m->dec.out_name[0], "audio");
-    strcpy(m->dec.out_name[1], "audio_lengths");
+    /* 流式解码: 2 个业务输入 + 4 个 transformer offset + 12 组注意力缓存 */
+    {
+        int n = 0;
+        strcpy(m->dec.in_name[n++], "audio_codes");
+        strcpy(m->dec.in_name[n++], "audio_code_lengths");
+        for (int i = 0; i < 4; i++) sprintf(m->dec.in_name[n++], "transformer_offset_%d", i);
+        for (int i = 0; i < SD_N_ATTN; i++) {
+            sprintf(m->dec.in_name[n++], "attn_offset_%d", i);
+            sprintf(m->dec.in_name[n++], "attn_cached_keys_%d", i);
+            sprintf(m->dec.in_name[n++], "attn_cached_values_%d", i);
+            sprintf(m->dec.in_name[n++], "attn_cached_positions_%d", i);
+        }
+        m->dec.n_in = (size_t)n;
 
-    for (int k = 0; k < 32; k++) {
+        n = 0;
+        strcpy(m->dec.out_name[n++], "audio");
+        strcpy(m->dec.out_name[n++], "audio_lengths");
+        for (int i = 0; i < 4; i++) sprintf(m->dec.out_name[n++], "transformer_offset_out_%d", i);
+        for (int i = 0; i < SD_N_ATTN; i++) {
+            sprintf(m->dec.out_name[n++], "attn_offset_out_%d", i);
+            sprintf(m->dec.out_name[n++], "attn_cached_keys_out_%d", i);
+            sprintf(m->dec.out_name[n++], "attn_cached_values_out_%d", i);
+            sprintf(m->dec.out_name[n++], "attn_cached_positions_out_%d", i);
+        }
+        m->dec.n_out = (size_t)n;
+    }
+
+    for (int k = 0; k < 64; k++) {
         m->prefill.in_ptr[k] = m->prefill.in_name[k];
         m->prefill.out_ptr[k] = m->prefill.out_name[k];
         m->decode.in_ptr[k] = m->decode.in_name[k];
@@ -1054,11 +1152,34 @@ static void models_open(Models* m, const wchar_t* dir, int threads)
         m->dec.out_ptr[k] = m->dec.out_name[k];
     }
 
-    sess_open(&m->prefill, dir, L"moss_tts_prefill.onnx", threads);
-    sess_open(&m->decode, dir, L"moss_tts_decode_step.onnx", threads);
-    sess_open(&m->frame, dir, L"moss_tts_local_fixed_sampled_frame.onnx", threads);
-    sess_open(&m->dec, dir, L"moss_audio_tokenizer_decode_full.onnx", threads);
-    sess_open(&m->enc, dir, L"moss_audio_tokenizer_encode.onnx", threads);
+    /* 四个 session 互不依赖, 并行加载 (加载阶段是图优化 + I/O 混合, 单线程很浪费) */
+    {
+        int cth = threads;
+        LoadJob jobs[4] = {
+            { &m->prefill, dir, L"moss_tts_prefill.onnx",                    threads, &g_stats.load_prefill, 0 },
+            { &m->decode,  dir, L"moss_tts_decode_step.onnx",                threads, &g_stats.load_decode, 0 },
+            { &m->frame,   dir, L"moss_tts_local_fixed_sampled_frame.onnx",  threads, &g_stats.load_frame, 0 },
+            { &m->dec,     dir, L"moss_audio_tokenizer_decode_step.onnx",    cth,     &g_stats.load_dec, 0 },
+        };
+        HANDLE th[4];
+        int started = 0;
+        for (int k = 0; k < 4; k++) {
+            th[k] = CreateThread(NULL, 0, load_worker, &jobs[k], 0, NULL);
+            if (th[k]) started++;
+        }
+        if (started == 4) {
+            WaitForMultipleObjects(4, th, TRUE, INFINITE);
+            for (int k = 0; k < 4; k++) CloseHandle(th[k]);
+        } else {
+            /* 线程创建失败就退回串行 */
+            for (int k = 0; k < started; k++) { WaitForSingleObject(th[k], INFINITE); CloseHandle(th[k]); }
+            for (int k = started; k < 4; k++) load_worker(&jobs[k]);
+        }
+    }
+
+    /* codec_encode 只在做声音克隆时用, 延迟到第一次需要时再加载 (省 4s + 44MB) */
+    wcsncpy(m->dir, dir, MAX_PATH - 1);
+    m->threads = threads;
 }
 
 /* 语音结束检测 (对应 Rust EndOfSpeechDetector, 但窗口从 8 帧放宽到 48 帧)。
@@ -1108,13 +1229,161 @@ static int eos_check(EosDetector* d, const int32_t* frame, int step)
     return 0;
 }
 
-/* 定义在 codec_decode 之后: 解码一小段并返回均方能量 (用于判断是否已说完) */
-static double codec_probe_energy(Models* m, const int16_t* codes, size_t frames);
+/* ---------------------------------------------------------------------------
+ * 流式 codec 解码器 (moss_audio_tokenizer_decode_step.onnx)
+ *
+ * 原先用 decode_full 一次性解码整段, 中间张量随音频长度线性膨胀 —— 实测 27 秒
+ * 音频要 ~1.9GB。这里换成带固定 KV 缓存的逐批解码: 缓存总量恒定 12.4MB, 与
+ * 音频长度无关; 而且边生成边解码, 省掉了最后那次整体解码。
+ * -------------------------------------------------------------------------*/
+typedef struct {
+    OrtValue* off[4];
+    OrtValue* aoff[SD_N_ATTN];
+    OrtValue* k[SD_N_ATTN];
+    OrtValue* v[SD_N_ATTN];
+    OrtValue* p[SD_N_ATTN];
+    int32_t   off_buf[4];
+    int32_t   aoff_buf[SD_N_ATTN];
+    float*    kv_own[SD_N_ATTN * 2];   /* 初始零缓存, 首次调用后即被 ORT 的输出替换 */
+    int32_t*  pos_own[SD_N_ATTN];
+    float*    pcm;                     /* 累积的交错音频 */
+    size_t    n_samples;               /* 每声道采样点数 */
+    size_t    cap;
+    double    last_energy;             /* 最近一批的均方能量 */
+} StreamDec;
 
-/* 生成音频帧; 返回帧数, *codes 为 frames*16 的 token */
+static void sd_free(StreamDec* sd)
+{
+    for (int i = 0; i < 4; i++) if (sd->off[i]) ort->ReleaseValue(sd->off[i]);
+    for (int i = 0; i < SD_N_ATTN; i++) {
+        if (sd->aoff[i]) ort->ReleaseValue(sd->aoff[i]);
+        if (sd->k[i])    ort->ReleaseValue(sd->k[i]);
+        if (sd->v[i])    ort->ReleaseValue(sd->v[i]);
+        if (sd->p[i])    ort->ReleaseValue(sd->p[i]);
+        free(sd->kv_own[i * 2]);
+        free(sd->kv_own[i * 2 + 1]);
+        free(sd->pos_own[i]);
+    }
+    free(sd->pcm);
+    memset(sd, 0, sizeof(*sd));
+}
+
+static void sd_init(StreamDec* sd)
+{
+    memset(sd, 0, sizeof(*sd));
+    for (int i = 0; i < 4; i++) {
+        int64_t sh[1] = { 1 };
+        sd->off_buf[i] = 0;
+        sd->off[i] = MK_I32(&sd->off_buf[i], sh, 1);
+    }
+    for (int i = 0; i < SD_N_ATTN; i++) {
+        int ctx = k_sd_ctx[i];
+        int64_t sh_off[1] = { 1 };
+        int64_t sh_kv[4]  = { 1, 4, ctx, 64 };
+        int64_t sh_pos[2] = { 1, ctx };
+        sd->aoff_buf[i] = 0;
+        sd->aoff[i] = MK_I32(&sd->aoff_buf[i], sh_off, 1);
+        float*   kb = (float*)xcalloc((size_t)4 * (size_t)ctx * 64, sizeof(float));
+        float*   vb = (float*)xcalloc((size_t)4 * (size_t)ctx * 64, sizeof(float));
+        int32_t* pb = (int32_t*)xmalloc(sizeof(int32_t) * (size_t)ctx);
+        for (int t = 0; t < ctx; t++) pb[t] = -1;   /* 未使用的位置填 -1 */
+        sd->kv_own[i * 2] = kb;
+        sd->kv_own[i * 2 + 1] = vb;
+        sd->pos_own[i] = pb;
+        sd->k[i] = MK_F32(kb, sh_kv, 4);
+        sd->v[i] = MK_F32(vb, sh_kv, 4);
+        sd->p[i] = MK_I32(pb, sh_pos, 2);
+    }
+}
+
+static void sd_append(StreamDec* sd, const float* interleaved, size_t n)
+{
+    if (sd->n_samples + n > sd->cap) {
+        size_t nc = sd->cap ? sd->cap : 65536;
+        while (nc < sd->n_samples + n) nc *= 2;
+        float* p = (float*)realloc(sd->pcm, sizeof(float) * nc * CHANNELS);
+        if (!p) die("out of memory");
+        sd->pcm = p;
+        sd->cap = nc;
+    }
+    memcpy(sd->pcm + sd->n_samples * CHANNELS, interleaved, sizeof(float) * n * CHANNELS);
+    sd->n_samples += n;
+}
+
+/* 解码 n 帧 (n*3840 个采样点), 结果追加到 sd->pcm */
+static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
+{
+    if (n == 0) return;
+
+    int32_t* ac = (int32_t*)xmalloc(sizeof(int32_t) * n * N_VQ);
+    for (size_t k = 0; k < n * N_VQ; k++) ac[k] = codes[k];
+    int32_t len_buf = (int32_t)n;
+    int64_t sh_codes[3] = { 1, (int64_t)n, N_VQ };
+    int64_t sh_len[1] = { 1 };
+
+    OrtValue* in[64] = {0};
+    int p = 0;
+    in[p++] = MK_I32(ac, sh_codes, 3);
+    in[p++] = MK_I32(&len_buf, sh_len, 1);
+    for (int i = 0; i < 4; i++) in[p++] = sd->off[i];
+    for (int i = 0; i < SD_N_ATTN; i++) {
+        in[p++] = sd->aoff[i];
+        in[p++] = sd->k[i];
+        in[p++] = sd->v[i];
+        in[p++] = sd->p[i];
+    }
+
+    OrtValue* out[64] = {0};
+    sess_run(&m->dec, in, out);
+
+    size_t cnt = 0, alen = 0;
+    float*   au = (float*)tensor_data(out[0], &cnt);
+    int32_t* al = (int32_t*)tensor_data(out[1], &alen);
+    size_t per = (al && alen > 0 && al[0] > 0) ? (size_t)al[0] : 0;
+    if (per == 0 || cnt < per * CHANNELS) die("stream decode returned no audio");
+
+    float* inter = (float*)xmalloc(sizeof(float) * per * CHANNELS);
+    double acc = 0.0;
+    for (size_t t = 0; t < per; t++) {
+        for (int c = 0; c < CHANNELS; c++) {
+            float v = au[c * per + t];
+            inter[t * CHANNELS + c] = v;
+            acc += (double)v * (double)v;
+        }
+    }
+    sd->last_energy = acc / (double)(per * CHANNELS);
+    sd_append(sd, inter, per);
+    free(inter);
+
+    /* 状态交替换入: 输出直接作为下一次的输入 */
+    ort->ReleaseValue(out[0]);
+    ort->ReleaseValue(out[1]);
+    ort->ReleaseValue(in[0]);
+    ort->ReleaseValue(in[1]);
+    for (int i = 0; i < 4; i++) ort->ReleaseValue(sd->off[i]);
+    for (int i = 0; i < SD_N_ATTN; i++) {
+        ort->ReleaseValue(sd->aoff[i]);
+        ort->ReleaseValue(sd->k[i]);
+        ort->ReleaseValue(sd->v[i]);
+        ort->ReleaseValue(sd->p[i]);
+    }
+    p = 2;
+    for (int i = 0; i < 4; i++) sd->off[i] = out[p++];
+    for (int i = 0; i < SD_N_ATTN; i++) {
+        sd->aoff[i] = out[p++];
+        sd->k[i] = out[p++];
+        sd->v[i] = out[p++];
+        sd->p[i] = out[p++];
+    }
+    free(ac);
+}
+
+/* 生成语音: 帧生成与 codec 解码交错进行, 音频直接累积到 out_pcm
+ * 返回生成的帧数 */
 static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
                               const int16_t* ref, size_t ref_frames,
-                              int16_t** codes, uint64_t seed, int max_frames,
+                              float** out_pcm, size_t* out_samples,
+                              uint64_t seed, int max_frames,
                               int verbose, int use_eos, const wchar_t* dump_frames)
 {
     size_t S = (size_t)12 + 1 + ref_frames + 1 + 56 + n_text + 6 + 1;
@@ -1163,13 +1432,11 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
      * OrtValue 去增减引用计数 -> 访问违例 (输出个数多时必现) */
     OrtValue* pout[32] = {0};
     if (verbose) fprintf(stderr, "  prefill: seq=%zu\n", S);
+    uint64_t _t0 = now_ms();
     sess_run(&m->prefill, pin, pout);
+    g_stats.prefill += now_ms() - _t0;
 
-    float* hidden_all = NULL;
-    size_t hn = 0;
-    hidden_all = (float*)tensor_data(pout[0], &hn);
-    if (hn < (size_t)HIDDEN) die("prefill returned no hidden states");
-
+    float* hidden_all = (float*)tensor_data(pout[0], NULL);
     float hidden[HIDDEN];
     memcpy(hidden, hidden_all + (S - 1) * HIDDEN, sizeof(float) * HIDDEN);
 
@@ -1184,9 +1451,11 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     free(ids);
     free(amask);
 
-    /* ---- 自回归帧循环 ---- */
-    Rng rng; rng_seed(&rng, seed);
-    EosDetector eos; memset(&eos, 0, sizeof(eos));
+    /* ---- 自回归帧循环 (边生成边解码) ---- */
+    Rng rng;
+    rng_seed(&rng, seed);
+    EosDetector eos;
+    memset(&eos, 0, sizeof(eos));
 
     uint8_t seen[N_VQ][AUDIO_CODEBOOK];
     memset(seen, 0, sizeof(seen));
@@ -1205,40 +1474,47 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     int32_t* pvl_buf = (int32_t*)xmalloc(sizeof(int32_t));
     int64_t sh_pvl[1] = { 1 };
 
+    /* 这几个输入张量的形状是固定的, 创建一次反复复用: ORT 不会改写输入,
+     * 每帧重新 CreateTensor 只是白白多出几十次分配/释放。 */
+    OrtValue* t_hidden = MK_F32(hidden, sh_hid, 2);
+    OrtValue* t_mask   = MK_I32(mask, sh_mask, 3);
+    OrtValue* t_asst   = MK_F32(u_asst, sh_one, 1);
+    OrtValue* t_audio  = MK_F32(u_audio, sh_rand, 2);
+    OrtValue* t_step   = MK_I32(step_ids, sh_step, 3);
+    OrtValue* t_pvl    = MK_I32(pvl_buf, sh_pvl, 1);
+
     int32_t past_len = (int32_t)S;
-    int silent_probes = 0;
+    int silent_batches = 0;
 
     int16_t* out = (int16_t*)xmalloc(sizeof(int16_t) * (size_t)max_frames * N_VQ);
     size_t n_frames = 0;
 
-    for (int step = 0; step < max_frames; step++) {
-        /* 重建 repetition mask */
-        memset(mask, 0, sizeof(int32_t) * (size_t)N_VQ * AUDIO_CODEBOOK);
-        for (int c = 0; c < N_VQ; c++) {
-            int32_t* row = mask + (size_t)c * AUDIO_CODEBOOK;
-            for (int t = 0; t < AUDIO_CODEBOOK; t++) if (seen[c][t]) row[t] = 1;
-        }
+    StreamDec sd;
+    sd_init(&sd);
 
+    /* 待解码的帧: 攒够 SD_BATCH 帧一起解码 (太小调度开销大, 太大峰值内存高) */
+    enum { SD_BATCH = 16 };
+    int16_t pend[SD_BATCH * N_VQ];
+    int n_pend = 0;
+
+    for (int step = 0; step < max_frames; step++) {
         u_asst[0] = rng_u(&rng);
         for (int c = 0; c < N_VQ; c++) u_audio[c] = rng_u(&rng);
 
-        OrtValue* fin[4] = {0};
-        fin[0] = MK_F32(hidden, sh_hid, 2);
-        fin[1] = MK_I32(mask, sh_mask, 3);
-        fin[2] = MK_F32(u_asst, sh_one, 1);
-        fin[3] = MK_F32(u_audio, sh_rand, 2);
+        OrtValue* fin[4] = { t_hidden, t_mask, t_asst, t_audio };
 
         OrtValue* fout[2] = { NULL, NULL };
+        _t0 = now_ms();
         sess_run(&m->frame, fin, fout);
+        g_stats.frame += now_ms() - _t0;
 
-        size_t scn = 0, ffn = 0;
-        int32_t* sc = (int32_t*)tensor_data(fout[0], &scn);
-        int32_t* fr = (int32_t*)tensor_data(fout[1], &ffn);
+        /* 形状固定 (1,1) / (1,16), 不用再查 shape */
+        int32_t* sc = (int32_t*)tensor_data(fout[0], NULL);
+        int32_t* fr = (int32_t*)tensor_data(fout[1], NULL);
         int32_t frame[N_VQ];
-        int keep = (sc && scn > 0 && sc[0] != 0);
-        for (int c = 0; c < N_VQ; c++) frame[c] = (c < (int)ffn) ? fr[c] : 0;
+        int keep = (sc && sc[0] != 0);
+        for (int c = 0; c < N_VQ; c++) frame[c] = fr[c];
 
-        for (int k = 0; k < 4; k++) ort->ReleaseValue(fin[k]);
         ort->ReleaseValue(fout[0]);
         ort->ReleaseValue(fout[1]);
 
@@ -1247,10 +1523,13 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
             break;
         }
 
-        /* 记录已见 token */
+        /* 记录已见 token: seen 只增不减, 所以 mask 也只需增量置位 */
         for (int c = 0; c < N_VQ; c++) {
             int t = frame[c];
-            if (t >= 0 && t < AUDIO_CODEBOOK) seen[c][t] = 1;
+            if (t >= 0 && t < AUDIO_CODEBOOK && !seen[c][t]) {
+                seen[c][t] = 1;
+                mask[(size_t)c * AUDIO_CODEBOOK + t] = 1;
+            }
         }
 
         if (use_eos && eos_check(&eos, frame, step)) {
@@ -1258,20 +1537,26 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
             break;
         }
 
-        for (int c = 0; c < N_VQ; c++) out[n_frames * N_VQ + c] = (int16_t)frame[c];
+        for (int c = 0; c < N_VQ; c++) {
+            out[n_frames * N_VQ + c] = (int16_t)frame[c];
+            pend[n_pend * N_VQ + c] = (int16_t)frame[c];
+        }
         n_frames++;
+        n_pend++;
 
-        /* 每 16 帧把尾部 8 帧解码出来看能量: 模型说完之后会一直吐静音,
-         * 但 should_continue 不一定变 0, 用能量判断才能真正收尾。 */
-        if (n_frames >= 24 && (n_frames % 16) == 0) {
-            double e = codec_probe_energy(m, out + (n_frames - 8) * N_VQ, 8);
-            if (e < 1.0e-5) {
-                if (++silent_probes >= 2) {
+        /* 攒够一批就解码; 顺便用解码出来的能量判断是不是已经说完 */
+        if (n_pend == SD_BATCH) {
+            uint64_t _tp = now_ms();
+            sd_run(m, &sd, pend, (size_t)n_pend);
+            g_stats.probe += now_ms() - _tp;
+            n_pend = 0;
+            if (sd.last_energy < 1.0e-5) {
+                if (++silent_batches >= 2) {
                     if (verbose) fprintf(stderr, "  [step %d] trailing silence, stop\n", step);
                     break;
                 }
             } else {
-                silent_probes = 0;
+                silent_batches = 0;
             }
         }
 
@@ -1281,27 +1566,36 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
         pvl_buf[0] = past_len;
 
         OrtValue* din[32] = {0};
-        din[0] = MK_I32(step_ids, sh_step, 3);
-        din[1] = MK_I32(pvl_buf, sh_pvl, 1);
+        din[0] = t_step;
+        din[1] = t_pvl;
         for (int k = 0; k < GLOBAL_LAYERS * 2; k++) din[2 + k] = kv[k];
 
         OrtValue* dout[32] = {0};
+        _t0 = now_ms();
         sess_run(&m->decode, din, dout);
+        g_stats.step += now_ms() - _t0;
+        g_stats.steps++;
 
         size_t dn = 0;
         float* dh = (float*)tensor_data(dout[0], &dn);
         if (dn >= (size_t)HIDDEN) memcpy(hidden, dh + dn - HIDDEN, sizeof(float) * HIDDEN);
 
         ort->ReleaseValue(dout[0]);
-        ort->ReleaseValue(din[0]);
-        ort->ReleaseValue(din[1]);
         for (int k = 0; k < GLOBAL_LAYERS * 2; k++) ort->ReleaseValue(kv[k]);
         for (int k = 0; k < GLOBAL_LAYERS * 2; k++) kv[k] = dout[1 + k];
 
         past_len++;
 
-        if (verbose && (step % 25 == 0))
-            fprintf(stderr, "  frame %d/%d\n", step + 1, max_frames);
+        if (verbose && (step % 50 == 0))
+            fprintf(stderr, "  frame %d/%d (seq %d)\n", step + 1, max_frames, past_len);
+    }
+
+    /* 把最后不足一批的帧也解码掉 */
+    if (n_pend > 0) {
+        uint64_t _tp = now_ms();
+        sd_run(m, &sd, pend, (size_t)n_pend);
+        g_stats.probe += now_ms() - _tp;
+        n_pend = 0;
     }
 
     if (dump_frames && dump_frames[0]) {
@@ -1315,70 +1609,25 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     }
 
     for (int k = 0; k < GLOBAL_LAYERS * 2; k++) ort->ReleaseValue(kv[k]);
+    ort->ReleaseValue(t_hidden); ort->ReleaseValue(t_mask);
+    ort->ReleaseValue(t_asst);   ort->ReleaseValue(t_audio);
+    ort->ReleaseValue(t_step);   ort->ReleaseValue(t_pvl);
     free(mask); free(u_asst); free(u_audio);
     free(step_ids); free(pvl_buf);
+    free(out);
 
-    *codes = out;
+    *out_pcm = sd.pcm;
+    *out_samples = sd.n_samples;
+    sd.pcm = NULL;
+    sd_free(&sd);
     return n_frames;
 }
-
-/* codec 解码: 返回交错立体声 float */
-static float* codec_decode(Models* m, const int16_t* codes, size_t frames, size_t* out_samples)
-{
-    int32_t* ac = (int32_t*)xmalloc(sizeof(int32_t) * frames * N_VQ);
-    for (size_t k = 0; k < frames * N_VQ; k++) ac[k] = codes[k];
-
-    int32_t len_buf = (int32_t)frames;
-    int64_t sh_codes[3] = { 1, (int64_t)frames, N_VQ };
-    int64_t sh_len[1] = { 1 };
-
-    OrtValue* in[2] = {0};
-    in[0] = MK_I32(ac, sh_codes, 3);
-    in[1] = MK_I32(&len_buf, sh_len, 1);
-
-    OrtValue* outv[2] = { NULL, NULL };
-    sess_run(&m->dec, in, outv);
-
-    size_t total = 0;
-    float* audio = (float*)tensor_data(outv[0], &total);
-    size_t alen = 0;
-    int32_t* al = (int32_t*)tensor_data(outv[1], &alen);
-    if (!al || alen < 1 || al[0] <= 0) die("codec decode returned bad audio_lengths");
-
-    size_t per_ch = (size_t)al[0];
-    size_t n_ch = total / per_ch;
-    if (n_ch == 0) die("codec decode returned no audio");
-
-    float* inter = (float*)xmalloc(sizeof(float) * per_ch * n_ch);
-    for (size_t s = 0; s < per_ch; s++)
-        for (size_t c = 0; c < n_ch; c++)
-            inter[s * n_ch + c] = audio[c * per_ch + s];
-
-    ort->ReleaseValue(outv[0]);
-    ort->ReleaseValue(outv[1]);
-    ort->ReleaseValue(in[0]);
-    ort->ReleaseValue(in[1]);
-    free(ac);
-
-    *out_samples = per_ch;
-    return inter;
-}
-
-/* 解码一小段 codes 并返回均方能量 (不用开方, 直接比平方) */
-static double codec_probe_energy(Models* m, const int16_t* codes, size_t frames)
-{
-    size_t n = 0;
-    float* pcm = codec_decode(m, codes, frames, &n);
-    if (!pcm || n == 0) { free(pcm); return 0.0; }
-    double acc = 0.0;
-    for (size_t i = 0; i < n * CHANNELS; i++) acc += (double)pcm[i] * (double)pcm[i];
-    free(pcm);
-    return acc / (double)(n * CHANNELS);
-}
-
 /* codec 编码: 参考音频 -> codes */
 static int16_t* codec_encode(Models* m, const float* interleaved, size_t frames, size_t* out_frames)
 {
+    if (!m->enc.s)
+        sess_open(&m->enc, m->dir, L"moss_audio_tokenizer_encode.onnx", m->threads, &g_stats.load_enc);
+
     float* planar = (float*)xmalloc(sizeof(float) * frames * CHANNELS);
     for (size_t s = 0; s < frames; s++)
         for (int c = 0; c < CHANNELS; c++)
@@ -1655,6 +1904,11 @@ int wmain(int argc, wchar_t** argv)
         printf("voice     : Junhao (%zu frames)\n", ref_frames);
     }
     printf("threads   : %d\n", threads);
+    if (verbose) {
+        size_t priv = 0, ws = cur_working_set(&priv);
+        fprintf(stderr, "  [mem] 模型加载后 working set %.0f MB, private %.0f MB\n",
+                (double)ws / 1048576.0, (double)priv / 1048576.0);
+    }
 
     /* ---- 分块合成 ---- */
     char** chunks = NULL;
@@ -1670,23 +1924,18 @@ int wmain(int argc, wchar_t** argv)
         if (verbose || nch > 1) printf("chunk %d/%d: %d tokens\n", ci + 1, nch, nt);
 
         uint64_t t1 = now_ms();
-        int16_t* codes = NULL;
+        float* pcm = NULL;
+        size_t nsamp = 0;
         size_t frames = generate_frames(&models, tids, (size_t)nt, ref, ref_frames,
-                                        &codes, seed, max_frames, verbose, !no_eos, dump_frames);
+                                        &pcm, &nsamp, seed, max_frames, verbose, !no_eos, dump_frames);
         uint64_t t2 = now_ms();
-        if (frames == 0) {
+        if (frames == 0 || !pcm || nsamp == 0) {
             fprintf(stderr, "  [warn] no frames generated for this chunk\n");
-            free(codes); free(tids);
+            free(pcm); free(tids);
             continue;
         }
-
-        size_t nsamp = 0;
-        float* pcm = codec_decode(&models, codes, frames, &nsamp);
-        uint64_t t3 = now_ms();
-
-        printf("  %zu frames -> %.2f s audio  (gen %llu ms, decode %llu ms)\n",
-               frames, (double)nsamp / SAMPLE_RATE,
-               (unsigned long long)(t2 - t1), (unsigned long long)(t3 - t2));
+        printf("  %zu frames -> %.2f s audio  (%llu ms)\n",
+               frames, (double)nsamp / SAMPLE_RATE, (unsigned long long)(t2 - t1));
 
         size_t pause = 0;
         if (ci + 1 < nch) pause = (size_t)(SAMPLE_RATE * 0.25);
@@ -1703,7 +1952,7 @@ int wmain(int argc, wchar_t** argv)
         }
         all = merged;
 
-        free(pcm); free(codes); free(tids);
+        free(pcm); free(tids);
     }
 
     for (int k = 0; k < nch; k++) free(chunks[k]);
@@ -1732,6 +1981,29 @@ int wmain(int argc, wchar_t** argv)
     char* op = w2u(out_path);
     printf("\nwrote %s : %.2f s @ %d Hz stereo\n", op ? op : "?", (double)total_samples / SAMPLE_RATE, SAMPLE_RATE);
     printf("total     : %llu ms\n", (unsigned long long)(t4 - t0));
+
+    g_stats.peak_rss = peak_working_set();
+    if (verbose) {
+        uint64_t load_sum = g_stats.load_prefill + g_stats.load_decode + g_stats.load_frame +
+                            g_stats.load_dec + g_stats.load_enc;
+        fprintf(stderr, "\n--- 耗时明细 ---\n");
+        fprintf(stderr, "  模型加载 : %5llu ms  (prefill %llu / decode %llu / frame %llu / codec-dec %llu / codec-enc %llu)\n",
+                (unsigned long long)load_sum,
+                (unsigned long long)g_stats.load_prefill, (unsigned long long)g_stats.load_decode,
+                (unsigned long long)g_stats.load_frame, (unsigned long long)g_stats.load_dec,
+                (unsigned long long)g_stats.load_enc);
+        fprintf(stderr, "  prefill  : %5llu ms\n", (unsigned long long)g_stats.prefill);
+        fprintf(stderr, "  采样帧   : %5llu ms  (%d 次, 均 %.1f ms)\n",
+                (unsigned long long)g_stats.frame, g_stats.steps,
+                g_stats.steps ? (double)g_stats.frame / g_stats.steps : 0.0);
+        fprintf(stderr, "  decode步 : %5llu ms  (均 %.1f ms)\n",
+                (unsigned long long)g_stats.step,
+                g_stats.steps ? (double)g_stats.step / g_stats.steps : 0.0);
+        fprintf(stderr, "  流式解码 : %5llu ms  (含能量判据)\n", (unsigned long long)g_stats.probe);
+        size_t priv2 = 0, ws2 = cur_working_set(&priv2);
+        fprintf(stderr, "  峰值内存 : %.1f MB (结束时 %.1f MB / private %.1f MB)\n",
+                (double)g_stats.peak_rss / 1048576.0, (double)ws2 / 1048576.0, (double)priv2 / 1048576.0);
+    }
     free(op);
 
     free(all);
