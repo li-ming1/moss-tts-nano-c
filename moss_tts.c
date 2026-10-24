@@ -251,7 +251,7 @@ static void ort_load(void)
 /* 各阶段耗时 / 峰值内存, 供 --verbose 输出 */
 typedef struct {
     uint64_t load_ort, load_prefill, load_decode, load_frame, load_dec, load_enc;
-    uint64_t prefill, frame, step, probe, decode;
+    uint64_t prefill, frame, step, probe;
     int steps;
     size_t peak_rss;
 } Stats;
@@ -1033,6 +1033,9 @@ static const int16_t k_ref_codes_junhao[1568] = {
 /* ---------------------------------------------------------------------------
  * 7. 推理
  * -------------------------------------------------------------------------*/
+#ifndef MOSS_SD_BATCH
+#define MOSS_SD_BATCH 16
+#endif
 #define SD_N_ATTN  12
 /* 各注意力层的上下文长度, 与 codec_browser_onnx_meta.json 的 streaming_decode 一致 */
 static const int k_sd_ctx[SD_N_ATTN] = { 500, 500, 500, 500, 800, 800, 1200, 1200, 1600, 1600, 1600, 1600 };
@@ -1493,7 +1496,7 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     sd_init(&sd);
 
     /* 待解码的帧: 攒够 SD_BATCH 帧一起解码 (太小调度开销大, 太大峰值内存高) */
-    enum { SD_BATCH = 16 };
+    enum { SD_BATCH = MOSS_SD_BATCH };
     int16_t pend[SD_BATCH * N_VQ];
     int n_pend = 0;
 
