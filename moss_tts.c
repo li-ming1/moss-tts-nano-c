@@ -1446,6 +1446,7 @@ typedef struct {
     int      live;
     uint64_t t_start, t_first;            /* 请求开始 / 首批音频出声时刻 */
     size_t   pushed;
+    size_t   emitted;                     /* 本请求实际推给声卡的采样数 */
 } Player;
 
 static void player_emit(Player* p, const float* inter, size_t n);
@@ -1508,6 +1509,7 @@ static void player_request(Player* p)
     p->t_first = 0;
     p->prebuffering = 1;
     p->pre_n = 0;
+    p->emitted = 0;
 }
 
 static void pre_append(Player* p, const float* inter, size_t n)
@@ -1602,6 +1604,7 @@ static void player_emit(Player* p, const float* inter, size_t n)
         off += take;
     }
     p->pushed += n;
+    p->emitted += n;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1707,6 +1710,12 @@ static float* probe_finish(Probe* pr, size_t* out_samples)
 static void player_drop_hold(Player* p)
 {
     p->hold_n = 0;
+    /* 没攒满 1s 的预缓冲要冲出去: 短句 (如 "你是谁" 只有 0.8s) 不冲就永远不播 */
+    if (p->prebuffering && p->pre_n > 0) {
+        p->prebuffering = 0;
+        if (p->live) player_emit(p, p->pre, p->pre_n);
+        p->pre_n = 0;
+    }
 }
 
 /* 生成语音: 帧生成与 codec 解码交错进行, 音频直接累积到 out_pcm
@@ -2966,14 +2975,28 @@ int wmain(int argc, wchar_t** argv)
                 }
                 double as = (double)tot / SAMPLE_RATE;
                 double gs = (double)(now_ms() - rq) / 1000.0;
-                printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f\n",
+                printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f%s%.2f s\n",
                        (unsigned long long)(player.t_first ? player.t_first - rq : 0),
-                       as, gs, as > 0.0 ? gs / as : 0.0);
+                       as, gs, as > 0.0 ? gs / as : 0.0,
+                       player.live ? " | 播放 " : "",
+                       player.live ? (double)player.emitted / SAMPLE_RATE : 0.0);
                 free(audio);
             } else {
                 fprintf(stderr, "  [warn] 没有生成音频\n");
             }
             free(lnorm);
+
+            /* 等这一段播完再回到提示符: 生成快于播放, 提示符先回来的话,
+             * 用户打下一句时听到的还是上一句的尾巴, 像是内容对不上 */
+            if (player.live) {
+                for (int t = 0; t < 3000; t++) {
+                    int busy = 0;
+                    for (int k = 0; k < PL_NBUF; k++)
+                        if (player.hdr[k].dwFlags & WHDR_INQUEUE) { busy = 1; break; }
+                    if (!busy) break;
+                    Sleep(20);
+                }
+            }
         }
         printf("\nserver    : 共 %d 次请求, 退出\n", req);
     } else {
