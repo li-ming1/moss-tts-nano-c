@@ -1,0 +1,1745 @@
+/* ============================================================================
+ *  moss_tts.c -- MOSS-TTS-Nano (0.1B) 纯 C11 单文件推理实现
+ * ----------------------------------------------------------------------------
+ *  参考实现: https://github.com/mzdk100/moss-tts-nano (Rust)
+ *  模型:     OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX
+ *            OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX
+ *
+ *  依赖:
+ *    - onnxruntime.dll (运行时 LoadLibrary 动态加载, 不需要 .lib / 导入库)
+ *    - onnxruntime_c_api.h / onnxruntime_error_code.h (编译期头文件)
+ *    - 静态 CRT (/MT), 因此生成的 exe 不依赖 vcruntime/ucrt DLL
+ *
+ *  流水线 (与 Rust 实现一致):
+ *
+ *    文本 --SentencePiece(BPE)--> token ids
+ *         |
+ *         v
+ *    [user_prefix][audio_start][ref audio codes][audio_end][after_ref]
+ *    [text tokens][assistant_prefix][audio_start]        <- 每行 17 列 = 1 文本 + 16 码本
+ *         |
+ *         v
+ *    prefill.onnx  ->  global_hidden[1,S,768] + 12 层 KV cache
+ *         |
+ *         v   (取最后一个位置的 hidden)
+ *    local_fixed_sampled_frame.onnx  ->  frame_token_ids[16]  (一次性采样 16 个通道)
+ *         |                                    ^
+ *         |                                    |  repetition_seen_mask + 随机数 u
+ *         v
+ *    decode_step.onnx (输入上一步的 16 个 token) -> 新的 hidden + 新 KV
+ *         |
+ *         v   (循环直到 should_continue==0 或检测到语音结束)
+ *    codec decode_full.onnx  ->  48kHz 立体声 PCM
+ *         |
+ *         v
+ *    out.wav (16-bit PCM)
+ * ==========================================================================*/
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+
+#include "onnxruntime_c_api.h"
+
+/* ---------------------------------------------------------------------------
+ * 0. 模型常量 (来自 tts_browser_onnx_meta.json / codec_browser_onnx_meta.json)
+ * -------------------------------------------------------------------------*/
+#define N_VQ              16      /* RVQ 码本数量 */
+#define ROW_WIDTH         (N_VQ + 1)  /* 每行 = 1 个文本 token + 16 个音频 token */
+#define HIDDEN            768
+#define GLOBAL_LAYERS     12
+#define VOCAB_SIZE        16384
+#define AUDIO_CODEBOOK    1024    /* 每个码本大小 */
+#define AUDIO_PAD_TOKEN   1024
+#define PAD_TOKEN         3
+#define AUDIO_START_TOKEN 6
+#define AUDIO_END_TOKEN   7
+#define AUDIO_USER_SLOT   8       /* 参考音频帧的行首 token */
+#define AUDIO_ASST_SLOT   9       /* 生成音频帧的行首 token */
+
+#define SAMPLE_RATE       48000
+#define CHANNELS          2
+#define DOWNSAMPLE        3840    /* 每帧 3840 个采样点 -> 12.5 Hz */
+
+#define MAX_FRAMES_DEF    375     /* 上限 30 秒 */
+#define EOS_WINDOW        48
+
+/* ---------------------------------------------------------------------------
+ * 1. 基础工具
+ * -------------------------------------------------------------------------*/
+static void die(const char* msg)
+{
+    fprintf(stderr, "\n[fatal] %s\n", msg);
+    fflush(stderr);
+    exit(1);
+}
+
+static void* xmalloc(size_t n)
+{
+    void* p = malloc(n ? n : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static void* xcalloc(size_t n, size_t sz)
+{
+    void* p = calloc(n ? n : 1, sz ? sz : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static char* w2u(const wchar_t* w)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) return NULL;
+    char* b = (char*)xmalloc((size_t)n);
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, b, n, NULL, NULL);
+    return b;
+}
+
+static uint64_t now_ms(void)
+{
+    return (uint64_t)GetTickCount64();
+}
+
+/* 读取整个文件 */
+static uint8_t* read_whole_file(const wchar_t* path, size_t* out_len)
+{
+    FILE* f = _wfopen(path, L"rb");
+    if (!f) return NULL;
+    if (_fseeki64(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long long sz = _ftelli64(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    if (_fseeki64(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    uint8_t* buf = (uint8_t*)xmalloc((size_t)sz + 1);
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = 0;
+    if (out_len) *out_len = rd;
+    return buf;
+}
+
+/* UTF-8 解码: 返回码点, *len 为字节数 */
+static uint32_t utf8_dec(const unsigned char* s, int* len)
+{
+    unsigned char b = s[0];
+    if (b < 0x80)            { *len = 1; return b; }
+    if ((b & 0xE0) == 0xC0)  { *len = 2; return ((uint32_t)(b & 0x1F) << 6) | (s[1] & 0x3F); }
+    if ((b & 0xF0) == 0xE0)  { *len = 3; return ((uint32_t)(b & 0x0F) << 12) | ((uint32_t)(s[1] & 0x3F) << 6) | (s[2] & 0x3F); }
+    if ((b & 0xF8) == 0xF0)  { *len = 4; return ((uint32_t)(b & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) | ((uint32_t)(s[2] & 0x3F) << 6) | (s[3] & 0x3F); }
+    *len = 1;
+    return b;
+}
+
+static int utf8_clen(unsigned char b)
+{
+    if (b < 0x80) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static int is_cjk_cp(uint32_t c)
+{
+    return (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) ||
+           (c >= 0x3040 && c <= 0x30FF) || (c >= 0xAC00 && c <= 0xD7AF) ||
+           (c >= 0x3000 && c <= 0x303F);
+}
+
+static int text_has_cjk(const char* s)
+{
+    const unsigned char* p = (const unsigned char*)s;
+    while (*p) {
+        int n;
+        uint32_t c = utf8_dec(p, &n);
+        if (is_cjk_cp(c)) return 1;
+        p += n;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 2. 随机数 (splitmix64 -> [0,1) float), 只为采样提供 u 值
+ * -------------------------------------------------------------------------*/
+typedef struct { uint64_t s; } Rng;
+
+static void rng_seed(Rng* r, uint64_t seed) { r->s = seed ? seed : 0x9E3779B97F4A7C15ull; }
+
+static uint64_t rng_next(Rng* r)
+{
+    uint64_t z = (r->s += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+/* [0, 1) 之间, 用高 24 位保证与 float 精度匹配 */
+static float rng_u(Rng* r)
+{
+    uint32_t v = (uint32_t)(rng_next(r) >> 40);   /* 24 bit */
+    return (float)v * (1.0f / 16777216.0f);
+}
+
+/* ---------------------------------------------------------------------------
+ * 3. ONNX Runtime 动态加载封装
+ * -------------------------------------------------------------------------*/
+static const OrtApi* ort = NULL;
+static OrtEnv* g_env = NULL;
+static OrtMemoryInfo* g_meminfo = NULL;
+
+#define OK(expr)                                                              \
+    do {                                                                      \
+        OrtStatus* _st = (expr);                                              \
+        if (_st) {                                                            \
+            fprintf(stderr, "\n[onnxruntime] %s\n  (%s:%d)\n",                \
+                    ort->GetErrorMessage(_st), __FILE__, __LINE__);           \
+            fflush(stderr);                                                   \
+            ort->ReleaseStatus(_st);                                          \
+            exit(1);                                                          \
+        }                                                                     \
+    } while (0)
+
+static void ort_load(void)
+{
+    HMODULE h = LoadLibraryA("onnxruntime.dll");
+    if (!h) {
+        /* 退回到 exe 所在目录 */
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        wchar_t* slash = wcsrchr(exe, L'\\');
+        if (slash) {
+            wcscpy(slash + 1, L"onnxruntime.dll");
+            h = LoadLibraryW(exe);
+        }
+    }
+    if (!h) die("cannot load onnxruntime.dll (put it next to the exe)");
+
+    typedef const OrtApiBase* (ORT_API_CALL * GetApiBaseFn)(void);
+    GetApiBaseFn fn = (GetApiBaseFn)(void*)GetProcAddress(h, "OrtGetApiBase");
+    if (!fn) die("onnxruntime.dll has no OrtGetApiBase export");
+
+    const OrtApiBase* base = fn();
+    fprintf(stderr, "[onnxruntime] %s (header api %d)\n", base->GetVersionString(), ORT_API_VERSION);
+    /* 头文件版本优先, 失败则依次降级 (OrtApi 结构体只追加不改变) */
+    static const int versions[] = { ORT_API_VERSION, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+    int chosen = 0;
+    for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]) && !ort; i++) {
+        ort = base->GetApi(versions[i]);
+        chosen = versions[i];
+    }
+    if (!ort) die("onnxruntime.dll is too old for this header");
+    fprintf(stderr, "[onnxruntime] using OrtApi v%d\n", chosen);
+
+    OK(ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "moss_tts", &g_env));
+    OK(ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_meminfo));
+}
+
+/* 一个 session + 输入输出名字表 */
+typedef struct {
+    OrtSession* s;
+    size_t n_in, n_out;
+    char in_name[32][48];
+    char out_name[32][48];
+    const char* in_ptr[32];
+    const char* out_ptr[32];
+} Session;
+
+static void sess_open(Session* S, const wchar_t* dir, const wchar_t* file, int threads)
+{
+    wchar_t path[MAX_PATH * 2];
+    _snwprintf(path, MAX_PATH * 2, L"%s\\%s", dir, file);
+
+    OrtSessionOptions* so = NULL;
+    OK(ort->CreateSessionOptions(&so));
+    OK(ort->SetIntraOpNumThreads(so, threads));
+    OK(ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
+    OrtStatus* st = ort->CreateSession(g_env, path, so, &S->s);
+    ort->ReleaseSessionOptions(so);
+    if (st) {
+        char* p = w2u(path);
+        fprintf(stderr, "\n[onnxruntime] %s\n  while loading %s\n",
+                ort->GetErrorMessage(st), p ? p : "?");
+        ort->ReleaseStatus(st);
+        exit(1);
+    }
+    if (S->n_in == 0) {
+        size_t n = 0;
+        OK(ort->SessionGetInputCount(S->s, &n));
+        S->n_in = n;
+    }
+    if (S->n_out == 0) {
+        size_t n = 0;
+        OK(ort->SessionGetOutputCount(S->s, &n));
+        S->n_out = n;
+    }
+}
+
+static void sess_run(Session* S, OrtValue** ins, OrtValue** outs)
+{
+    OK(ort->Run(S->s, NULL, S->in_ptr, (const OrtValue* const*)ins, S->n_in,
+                S->out_ptr, S->n_out, outs));
+}
+
+static void* tensor_data(OrtValue* v, size_t* count)
+{
+    void* p = NULL;
+    OK(ort->GetTensorMutableData(v, &p));
+    if (count) {
+        OrtTensorTypeAndShapeInfo* info = NULL;
+        OK(ort->GetTensorTypeAndShape(v, &info));
+        OK(ort->GetTensorShapeElementCount(info, count));
+        ort->ReleaseTensorTypeAndShapeInfo(info);
+    }
+    return p;
+}
+
+static OrtValue* mk_tensor(void* data, const int64_t* shape, int rank,
+                           size_t elem_size, ONNXTensorElementDataType dt)
+{
+    size_t n = 1;
+    for (int i = 0; i < rank; i++) n *= (size_t)shape[i];
+    OrtValue* v = NULL;
+    OK(ort->CreateTensorWithDataAsOrtValue(g_meminfo, data, n * elem_size,
+                                           shape, (size_t)rank, dt, &v));
+    return v;
+}
+
+#define MK_I32(buf, shape, rank) mk_tensor((buf), (shape), (rank), 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32)
+#define MK_F32(buf, shape, rank) mk_tensor((buf), (shape), (rank), 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+
+/* ---------------------------------------------------------------------------
+ * 4. SentencePiece (BPE + precompiled_charsmap 归一化)
+ *
+ *    tokenizer.model 是 protobuf, 这里手写最小的 wire-format 解析器,
+ *    不做任何第三方依赖。
+ * -------------------------------------------------------------------------*/
+typedef struct {
+    const char* p;     /* 指向模型文件内的字节, 不保证 NUL 结尾 */
+    int32_t     len;
+    float       score;
+    int32_t     type;  /* 1=normal 2=unknown 3=control 4=user 5=unused 6=byte */
+} Piece;
+
+typedef struct {
+    uint8_t*  blob;        /* 整个 tokenizer.model */
+    Piece*    pieces;
+    int32_t   n_pieces;
+
+    int32_t*  table;       /* 哈希表: piece id, -1 为空 */
+    uint32_t  table_mask;
+
+    const uint8_t* charsmap;   /* precompiled_charsmap */
+    size_t    charsmap_len;
+    const uint32_t* units;     /* darts double-array */
+    uint32_t  n_units;
+    const char* norm_blob;     /* 归一化替换串池 */
+    size_t    norm_blob_len;
+
+    int add_dummy_prefix;
+    int remove_extra_ws;
+    int escape_ws;
+    int unk_id;
+    int model_type;        /* 2 = BPE */
+} SP;
+
+static uint32_t pb_varint(const uint8_t* b, size_t* i)
+{
+    uint32_t r = 0; int sh = 0;
+    for (;;) {
+        uint8_t x = b[(*i)++];
+        r |= (uint32_t)(x & 0x7F) << sh;
+        if (!(x & 0x80)) return r;
+        sh += 7;
+        if (sh > 28) return r;
+    }
+}
+
+/* 遍历 protobuf 字段: 返回 field number, 通过 *wt 给出 wire type */
+static int pb_next(const uint8_t* b, size_t len, size_t* i, int* wt, uint32_t* vlen)
+{
+    if (*i >= len) return -1;
+    uint32_t key = pb_varint(b, i);
+    int fn = (int)(key >> 3);
+    *wt = (int)(key & 7);
+    if (*wt == 0) {
+        *vlen = pb_varint(b, i);
+    } else if (*wt == 2) {
+        *vlen = pb_varint(b, i);
+    } else if (*wt == 5) {
+        *vlen = 4;
+    } else if (*wt == 1) {
+        *vlen = 8;
+    } else {
+        *vlen = 0;
+    }
+    return fn;
+}
+
+static uint32_t sp_hash(const char* p, int len)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) { h ^= (uint8_t)p[i]; h *= 16777619u; }
+    return h;
+}
+
+static int sp_find(const SP* sp, const char* p, int len)
+{
+    uint32_t h = sp_hash(p, len) & sp->table_mask;
+    for (;;) {
+        int32_t id = sp->table[h];
+        if (id < 0) return -1;
+        if (sp->pieces[id].len == len && memcmp(sp->pieces[id].p, p, (size_t)len) == 0)
+            return id;
+        h = (h + 1) & sp->table_mask;
+    }
+}
+
+static void sp_parse_piece(SP* sp, const uint8_t* b, size_t len, Piece* out)
+{
+    size_t i = 0;
+    out->p = NULL; out->len = 0; out->score = 0.0f; out->type = 1;
+    while (i < len) {
+        int wt; uint32_t vl;
+        int fn = pb_next(b, len, &i, &wt, &vl);
+        if (fn < 0) break;
+        if (fn == 1 && wt == 2) {
+            out->p = (const char*)(b + i);
+            out->len = (int32_t)vl;
+            i += vl;
+        } else if (fn == 2 && wt == 5) {
+            float f;
+            memcpy(&f, b + i, 4);
+            out->score = f;
+            i += 4;
+        } else if (fn == 3 && wt == 0) {
+            out->type = (int32_t)vl;
+        } else {
+            i += vl;
+        }
+    }
+}
+
+static void sp_load(SP* sp, const wchar_t* path)
+{
+    memset(sp, 0, sizeof(*sp));
+    sp->add_dummy_prefix = 1;
+    sp->remove_extra_ws = 1;
+    sp->escape_ws = 1;
+    sp->model_type = 1;
+
+    size_t len = 0;
+    sp->blob = read_whole_file(path, &len);
+    if (!sp->blob) die("cannot read tokenizer.model");
+
+    /* 先数一遍 piece 数量 */
+    int32_t cap = 0;
+    {
+        size_t i = 0;
+        while (i < len) {
+            int wt; uint32_t vl;
+            int fn = pb_next(sp->blob, len, &i, &wt, &vl);
+            if (fn < 0) break;
+            if (fn == 1 && wt == 2) cap++;
+            i += vl;
+        }
+    }
+    sp->pieces = (Piece*)xcalloc((size_t)cap, sizeof(Piece));
+    sp->n_pieces = 0;
+
+    size_t i = 0;
+    while (i < len) {
+        int wt; uint32_t vl;
+        int fn = pb_next(sp->blob, len, &i, &wt, &vl);
+        if (fn < 0) break;
+        const uint8_t* body = sp->blob + i;
+        if (fn == 1 && wt == 2) {
+            sp_parse_piece(sp, body, vl, &sp->pieces[sp->n_pieces++]);
+        } else if (fn == 2 && wt == 2) {           /* TrainerSpec */
+            size_t j = 0;
+            while (j < vl) {
+                int w2; uint32_t v2;
+                int f2 = pb_next(body, vl, &j, &w2, &v2);
+                if (f2 < 0) break;
+                if (f2 == 3 && w2 == 0) sp->model_type = (int)v2;
+                else if (f2 == 40 && w2 == 0) sp->unk_id = (int)v2;
+                j += (w2 == 0) ? 0 : v2;
+            }
+        } else if (fn == 3 && wt == 2) {           /* NormalizerSpec */
+            size_t j = 0;
+            while (j < vl) {
+                int w2; uint32_t v2;
+                int f2 = pb_next(body, vl, &j, &w2, &v2);
+                if (f2 < 0) break;
+                if (f2 == 2 && w2 == 2) {
+                    sp->charsmap = body + j;
+                    sp->charsmap_len = v2;
+                } else if (f2 == 3 && w2 == 0) sp->add_dummy_prefix = (int)v2;
+                else if (f2 == 4 && w2 == 0) sp->remove_extra_ws = (int)v2;
+                else if (f2 == 5 && w2 == 0) sp->escape_ws = (int)v2;
+                j += (w2 == 0) ? 0 : v2;
+            }
+        }
+        i += vl;
+    }
+    if (sp->n_pieces <= 0) die("tokenizer.model: no pieces");
+
+    /* 哈希表 */
+    uint32_t sz = 1;
+    while (sz < (uint32_t)sp->n_pieces * 2u) sz <<= 1;
+    sp->table = (int32_t*)xmalloc(sizeof(int32_t) * sz);
+    for (uint32_t k = 0; k < sz; k++) sp->table[k] = -1;
+    sp->table_mask = sz - 1;
+    for (int32_t k = 0; k < sp->n_pieces; k++) {
+        uint32_t h = sp_hash(sp->pieces[k].p, sp->pieces[k].len) & sp->table_mask;
+        while (sp->table[h] >= 0) h = (h + 1) & sp->table_mask;
+        sp->table[h] = k;
+    }
+
+    /* charsmap: uint32 trie_size + trie + 替换串池 */
+    if (sp->charsmap && sp->charsmap_len > 8) {
+        uint32_t trie_bytes;
+        memcpy(&trie_bytes, sp->charsmap, 4);
+        if (trie_bytes + 4 <= sp->charsmap_len) {
+            sp->units = (const uint32_t*)(sp->charsmap + 4);
+            sp->n_units = trie_bytes / 4;
+            sp->norm_blob = (const char*)(sp->charsmap + 4 + trie_bytes);
+            sp->norm_blob_len = sp->charsmap_len - 4 - trie_bytes;
+        }
+    }
+}
+
+/* darts-clone 双数组 trie 的位布局 */
+#define DA_LABEL(u)     ((uint32_t)((u) & 0xFF))
+#define DA_HAS_LEAF(u)  ((uint32_t)(((u) >> 8) & 1))
+#define DA_VALUE(u)     ((uint32_t)((u) & 0x7FFFFFFFu))
+#define DA_OFFSET(u)    ((uint32_t)(((u) >> 10) << (((u) & (1u << 9)) >> 6)))
+
+/* 在 charsmap trie 上做最长前缀匹配.
+ * 返回消耗的输入字节数; *rep / *rep_len 给出替换串 (可能是空串 = 删除). */
+static int sp_norm_prefix(const SP* sp, const char* s, int avail,
+                          const char** rep, int* rep_len)
+{
+    int best_len = 0;
+    uint32_t best_val = 0;
+
+    if (sp->units && sp->n_units > 0) {
+        uint32_t node = 0;
+        uint32_t u = sp->units[0];
+        node ^= DA_OFFSET(u);
+        for (int k = 0; k < avail; k++) {
+            uint32_t ch = (uint8_t)s[k];
+            node ^= ch;
+            if (node >= sp->n_units) break;
+            u = sp->units[node];
+            if (DA_LABEL(u) != ch) break;
+            node ^= DA_OFFSET(u);
+            if (DA_HAS_LEAF(u)) { best_len = k + 1; best_val = DA_VALUE(u); }
+        }
+    }
+
+    if (best_len == 0) {                      /* 无匹配: 原样复制一个 UTF-8 字符 */
+        int n = utf8_clen((unsigned char)s[0]);
+        if (n > avail) n = avail;
+        *rep = s;
+        *rep_len = n;
+        return n;
+    }
+
+    /* 替换串在池中以 NUL 结尾 */
+    const char* p = sp->norm_blob + best_val;
+    size_t remain = sp->norm_blob_len > best_val ? sp->norm_blob_len - best_val : 0;
+    const char* z = (const char*)memchr(p, 0, remain);
+    *rep = p;
+    *rep_len = (int)(z ? (size_t)(z - p) : remain);
+    return best_len;
+}
+
+/* 归一化: 应用 charsmap + 空格转义 + dummy prefix */
+static int sp_normalize(const SP* sp, const char* text, char** out)
+{
+    size_t n_in = strlen(text);
+    size_t cap = n_in * 4 + 64;
+    char* buf = (char*)xmalloc(cap);
+    size_t o = 0;
+
+    const char* SPACE = "\xE2\x96\x81";   /* U+2581 ▁ */
+    int prev_space = sp->add_dummy_prefix;
+    if (sp->add_dummy_prefix) { memcpy(buf + o, SPACE, 3); o += 3; }
+
+    size_t i = 0;
+    while (i < n_in) {
+        const char* rep = NULL;
+        int rep_len = 0;
+        int consumed = sp_norm_prefix(sp, text + i, (int)(n_in - i), &rep, &rep_len);
+        if (consumed <= 0) consumed = 1;
+        i += (size_t)consumed;
+
+        if (o + (size_t)rep_len * 4 + 16 > cap) {
+            cap = cap * 2 + (size_t)rep_len * 4 + 64;
+            buf = (char*)realloc(buf, cap);
+            if (!buf) die("out of memory");
+        }
+
+        /* 把替换串按字符喂进空白处理逻辑 */
+        int j = 0;
+        while (j < rep_len) {
+            unsigned char c = (unsigned char)rep[j];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (sp->escape_ws) {
+                    if (!prev_space) {
+                        memcpy(buf + o, SPACE, 3); o += 3;
+                        prev_space = 1;
+                    }
+                    if (!sp->remove_extra_ws) { memcpy(buf + o, SPACE, 3); o += 3; }
+                } else {
+                    if (!sp->remove_extra_ws || !prev_space) { buf[o++] = ' '; prev_space = 1; }
+                }
+                j++;
+            } else {
+                int n = utf8_clen(c);
+                if (j + n > rep_len) n = rep_len - j;
+                memcpy(buf + o, rep + j, (size_t)n);
+                o += (size_t)n;
+                prev_space = 0;
+                j += n;
+            }
+        }
+    }
+    buf[o] = 0;
+    *out = buf;
+    return (int)o;
+}
+
+/* 文本级预处理 (对应 Rust normalize_for_tts) */
+static char* normalize_for_tts(const char* text)
+{
+    size_t n = strlen(text);
+    char* s = (char*)xmalloc(n + 32);
+    size_t o = 0;
+    int prev_space = 0;
+    /* 去首尾空白 + 折叠空白 + 换行制表转空格 */
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (o == 0) continue;          /* 跳过前导空白 */
+            if (prev_space) continue;
+            s[o++] = ' ';
+            prev_space = 1;
+        } else {
+            s[o++] = (char)c;
+            prev_space = 0;
+        }
+    }
+    while (o > 0 && s[o - 1] == ' ') o--;
+    s[o] = 0;
+
+    if (o == 0) return s;
+
+    int has_end = 0;
+    /* ASCII 标点或常见中英文结束符 */
+    if (o >= 1) {
+        unsigned char c = (unsigned char)s[o - 1];
+        if (c < 0x80 && ((c >= '!' && c <= '/') || (c >= ':' && c <= '@') ||
+                         (c >= '[' && c <= '`') || (c >= '{' && c <= '~'))) has_end = 1;
+    }
+    static const char* ends[] = { "。", "！", "？", "；", "：", "、", "，", "）", "】",
+                                  "》", "」", "』", "\"", "'" };
+    for (size_t k = 0; k < sizeof(ends) / sizeof(ends[0]); k++) {
+        size_t el = strlen(ends[k]);
+        if (o >= el && memcmp(s + o - el, ends[k], el) == 0) { has_end = 1; break; }
+    }
+
+    if (!has_end) {
+        if (text_has_cjk(s)) { s[o] = (char)0xE3; s[o + 1] = (char)0x80; s[o + 2] = (char)0x82; o += 3; }
+        else { s[o] = '.'; o += 1; }
+        s[o] = 0;
+    }
+    return s;
+}
+
+/* BPE 编码: 从单字符开始, 每次合并 score 最高的相邻对 */
+static int sp_encode(const SP* sp, const char* text, int32_t* out, int max_out)
+{
+    char* norm = NULL;
+    int nb = sp_normalize(sp, text, &norm);
+    if (nb <= 0) { free(norm); return 0; }
+
+    /* 字符边界 */
+    int nch = 0;
+    for (int i = 0; i < nb; ) { i += utf8_clen((unsigned char)norm[i]); nch++; }
+    if (nch == 0) { free(norm); return 0; }
+
+    int* off = (int*)xmalloc(sizeof(int) * (size_t)(nch + 1));
+    {
+        int i = 0, k = 0;
+        while (i < nb) { off[k++] = i; i += utf8_clen((unsigned char)norm[i]); }
+        off[nch] = nb;
+    }
+
+    typedef struct { int a, b, id; } Tok;   /* a,b = 字符下标 [a,b) */
+    Tok* tk = (Tok*)xmalloc(sizeof(Tok) * (size_t)(nch + 2));
+    int nt = 0;
+    for (int k = 0; k < nch; k++) {
+        int id = sp_find(sp, norm + off[k], off[k + 1] - off[k]);
+        if (id < 0) id = sp->unk_id;
+        tk[nt].a = k; tk[nt].b = k + 1; tk[nt].id = id;
+        nt++;
+    }
+
+    char tmp[128];
+    while (nt > 1) {
+        int best_i = -1;
+        float best_s = -1e30f;
+        for (int k = 0; k + 1 < nt; k++) {
+            int a = off[tk[k].a], b = off[tk[k + 1].b];
+            int L = b - a;
+            if (L >= (int)sizeof(tmp)) continue;
+            memcpy(tmp, norm + a, (size_t)L);
+            int id = sp_find(sp, tmp, L);
+            if (id < 0) continue;
+            if (sp->pieces[id].score > best_s) { best_s = sp->pieces[id].score; best_i = k; }
+        }
+        if (best_i < 0) break;
+        tk[best_i].b = tk[best_i + 1].b;
+        {
+            int a = off[tk[best_i].a], b = off[tk[best_i].b];
+            int L = b - a;
+            memcpy(tmp, norm + a, (size_t)L);
+            tk[best_i].id = sp_find(sp, tmp, L);
+        }
+        memmove(tk + best_i + 1, tk + best_i + 2, sizeof(Tok) * (size_t)(nt - best_i - 2));
+        nt--;
+    }
+
+    int n = 0;
+    for (int k = 0; k < nt && n < max_out; k++) out[n++] = tk[k].id;
+
+    free(off); free(tk); free(norm);
+    return n;
+}
+
+static int sp_count(const SP* sp, const char* text)
+{
+    static int32_t buf[4096];
+    return sp_encode(sp, text, buf, 4096);
+}
+
+/* ---------------------------------------------------------------------------
+ * 5. WAV I/O
+ * -------------------------------------------------------------------------*/
+static void wav_write_stereo(const wchar_t* path, const float* planar, size_t frames,
+                             int channels, int rate)
+{
+    uint32_t data_bytes = (uint32_t)(frames * (size_t)channels * 2u);
+    uint32_t byte_rate = (uint32_t)(rate * channels * 2);
+    uint16_t block_align = (uint16_t)(channels * 2);
+
+    FILE* f = _wfopen(path, L"wb");
+    if (!f) die("cannot open output wav");
+
+    uint8_t hdr[44];
+    uint32_t riff = 36 + data_bytes;
+    memcpy(hdr + 0, "RIFF", 4);
+    memcpy(hdr + 4, &riff, 4);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    uint32_t fmtlen = 16;      memcpy(hdr + 16, &fmtlen, 4);
+    uint16_t pcm = 1;          memcpy(hdr + 20, &pcm, 2);
+    uint16_t ch = (uint16_t)channels; memcpy(hdr + 22, &ch, 2);
+    uint32_t sr = (uint32_t)rate;     memcpy(hdr + 24, &sr, 4);
+    memcpy(hdr + 28, &byte_rate, 4);
+    memcpy(hdr + 32, &block_align, 2);
+    uint16_t bits = 16;        memcpy(hdr + 34, &bits, 2);
+    memcpy(hdr + 36, "data", 4);
+    memcpy(hdr + 40, &data_bytes, 4);
+    fwrite(hdr, 1, 44, f);
+
+    int16_t* pcmbuf = (int16_t*)xmalloc((size_t)frames * (size_t)channels * sizeof(int16_t));
+    for (size_t i = 0; i < frames * (size_t)channels; i++) {
+        float v = planar[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        pcmbuf[i] = (int16_t)(v * 32767.0f);
+    }
+    fwrite(pcmbuf, sizeof(int16_t), frames * (size_t)channels, f);
+    free(pcmbuf);
+    fclose(f);
+}
+
+/* 读 wav -> 48kHz 立体声交错浮点; 支持 PCM16 / float32, 单声道自动复制 */
+static float* wav_read_48k_stereo(const wchar_t* path, size_t* out_frames)
+{
+    size_t len = 0;
+    uint8_t* b = read_whole_file(path, &len);
+    if (!b) return NULL;
+    if (len < 44 || memcmp(b, "RIFF", 4) != 0 || memcmp(b + 8, "WAVE", 4) != 0) {
+        free(b); return NULL;
+    }
+
+    int channels = 0, bits = 0, fmt = 0, rate = 0;
+    const uint8_t* data = NULL;
+    size_t data_len = 0;
+
+    size_t i = 12;
+    while (i + 8 <= len) {
+        const char* id = (const char*)(b + i);
+        uint32_t sz;
+        memcpy(&sz, b + i + 4, 4);
+        const uint8_t* body = b + i + 8;
+        if (i + 8 + sz > len) sz = (uint32_t)(len - i - 8);
+        if (memcmp(id, "fmt ", 4) == 0 && sz >= 16) {
+            uint16_t v16;
+            memcpy(&v16, body + 0, 2); fmt = v16;
+            memcpy(&v16, body + 2, 2); channels = v16;
+            memcpy(&v16, body + 14, 2); bits = v16;
+            uint32_t v32; memcpy(&v32, body + 4, 4); rate = (int)v32;
+        } else if (memcmp(id, "data", 4) == 0) {
+            data = body; data_len = sz;
+        }
+        i += 8 + sz + (sz & 1);
+    }
+    if (!data || channels <= 0 || rate <= 0) { free(b); return NULL; }
+
+    size_t n_in_frames = 0;
+    int bytes_per_sample = bits / 8;
+    if (bytes_per_sample <= 0) { free(b); return NULL; }
+    n_in_frames = data_len / ((size_t)channels * (size_t)bytes_per_sample);
+
+    /* 先转成 float 平面 */
+    float* src = (float*)xmalloc(sizeof(float) * n_in_frames * (size_t)channels);
+    for (size_t k = 0; k < n_in_frames * (size_t)channels; k++) {
+        float v = 0.0f;
+        if (fmt == 3 && bits == 32) {
+            memcpy(&v, data + k * 4, 4);
+        } else if (bits == 16) {
+            int16_t s; memcpy(&s, data + k * 2, 2); v = (float)s / 32768.0f;
+        } else if (bits == 24) {
+            const uint8_t* p = data + k * 3;
+            int32_t s = (int32_t)((uint32_t)p[0] << 8 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 24) >> 8;
+            v = (float)s / 8388608.0f;
+        } else if (bits == 32) {
+            int32_t s; memcpy(&s, data + k * 4, 4); v = (float)((double)s / 2147483648.0);
+        }
+        src[k] = v;
+    }
+    free(b);
+
+    /* 线性重采样到 48k */
+    double ratio = (double)rate / (double)SAMPLE_RATE;
+    size_t n_out = (size_t)((double)n_in_frames / ratio);
+    if (n_out < 1) { free(src); return NULL; }
+
+    float* out = (float*)xmalloc(sizeof(float) * n_out * (size_t)CHANNELS);
+    for (size_t k = 0; k < n_out; k++) {
+        double pos = (double)k * ratio;
+        size_t i0 = (size_t)pos;
+        double frac = pos - (double)i0;
+        size_t i1 = i0 + 1 < n_in_frames ? i0 + 1 : i0;
+        for (int c = 0; c < CHANNELS; c++) {
+            int sc = c < channels ? c : 0;
+            float a = src[i0 * (size_t)channels + (size_t)sc];
+            float bb = src[i1 * (size_t)channels + (size_t)sc];
+            out[k * CHANNELS + c] = (float)(a + (bb - a) * frac);
+        }
+    }
+    free(src);
+    *out_frames = n_out;
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * 6. 提示词模板 + 内置音色 (数据由 tools/gen_prompt_c.py 从 manifest 生成)
+ * -------------------------------------------------------------------------*/
+/* ---- prompt templates (from browser_poc_manifest.json) ---- */
+static const int32_t k_user_prefix[12] = {
+    600, 289, 10356, 13, 10356, 10425, 1860, 4546, 12907, 10363, 13325, 11492,
+};
+
+static const int32_t k_after_ref[56] = {
+    10356, 10425, 3965, 7738, 11492, 505, 587, 10356, 10425, 352, 500, 856, 11492, 505, 587, 10356,
+    10425, 2128, 1247, 594, 11492, 505, 587, 10356, 10425, 348, 909, 561, 3648, 11492, 505, 587,
+    10356, 10425, 2818, 1305, 355, 348, 909, 11492, 505, 587, 10356, 10425, 484, 339, 10367, 783,
+    11492, 505, 587, 10356, 10425, 2427, 980, 11492,
+};
+
+static const int32_t k_asst_prefix[6] = {
+    10356, 14, 5, 4, 8165, 430,
+};
+
+/* ---- built-in voice "Junhao" (CN 欢迎关注模思智能), 98 frames x 16 codebooks ---- */
+static const int16_t k_ref_codes_junhao[1568] = {
+    922, 507, 253, 140, 700, 228, 523, 612, 20, 194, 877, 682, 415, 244, 181, 195,
+    503, 720, 733, 615, 153, 759, 1023, 541, 744, 1015, 245, 68, 323, 183, 307, 854,
+    829, 958, 621, 750, 839, 865, 683, 955, 102, 557, 317, 968, 391, 539, 671, 425,
+    295, 776, 279, 19, 61, 173, 65, 189, 923, 586, 42, 125, 442, 341, 462, 90,
+    556, 787, 992, 553, 436, 483, 618, 160, 504, 550, 402, 169, 607, 576, 72, 507,
+    537, 11, 699, 752, 135, 176, 122, 587, 722, 1016, 732, 103, 818, 680, 794, 605,
+    314, 426, 584, 58, 853, 859, 349, 113, 295, 128, 939, 692, 225, 203, 107, 881,
+    568, 471, 263, 796, 587, 485, 874, 63, 918, 571, 191, 528, 308, 807, 979, 412,
+    363, 1018, 425, 985, 140, 7, 264, 833, 943, 111, 568, 241, 630, 759, 444, 164,
+    101, 956, 551, 11, 250, 581, 458, 487, 105, 74, 2, 382, 141, 818, 414, 652,
+    650, 814, 47, 264, 24, 509, 691, 425, 518, 997, 802, 711, 960, 154, 400, 93,
+    64, 296, 383, 755, 333, 962, 864, 917, 561, 1022, 403, 329, 5, 461, 527, 18,
+    522, 631, 510, 341, 247, 290, 782, 670, 758, 395, 102, 571, 394, 356, 746, 857,
+    522, 304, 672, 148, 205, 180, 900, 807, 665, 302, 47, 480, 638, 258, 518, 304,
+    522, 631, 200, 526, 535, 378, 231, 868, 807, 798, 634, 784, 969, 993, 96, 15,
+    522, 631, 366, 561, 420, 58, 557, 372, 961, 190, 812, 571, 800, 757, 672, 767,
+    522, 258, 944, 526, 334, 378, 724, 1014, 759, 582, 812, 451, 547, 130, 116, 114,
+    681, 489, 801, 220, 779, 901, 1007, 1000, 786, 439, 214, 508, 972, 678, 53, 951,
+    129, 487, 7, 540, 588, 487, 627, 760, 717, 20, 174, 309, 567, 76, 1006, 510,
+    762, 580, 568, 606, 634, 603, 541, 33, 796, 43, 239, 708, 168, 974, 135, 422,
+    843, 472, 764, 106, 669, 796, 760, 587, 158, 82, 170, 13, 169, 374, 474, 975,
+    643, 186, 140, 62, 748, 359, 433, 56, 102, 646, 470, 3, 887, 185, 782, 421,
+    303, 237, 900, 853, 806, 193, 994, 876, 150, 202, 897, 551, 227, 286, 167, 662,
+    511, 662, 411, 60, 970, 669, 153, 316, 1004, 380, 753, 260, 1006, 730, 309, 98,
+    699, 511, 808, 376, 266, 113, 694, 474, 412, 436, 6, 906, 155, 120, 435, 371,
+    100, 19, 600, 915, 143, 807, 851, 899, 209, 174, 594, 929, 567, 104, 503, 267,
+    931, 549, 132, 1008, 530, 577, 729, 382, 983, 114, 807, 8, 213, 369, 41, 160,
+    358, 787, 131, 179, 83, 173, 205, 338, 427, 12, 681, 69, 806, 115, 925, 948,
+    116, 445, 200, 935, 584, 320, 558, 720, 501, 187, 67, 428, 676, 682, 758, 799,
+    522, 502, 349, 1006, 791, 619, 449, 579, 879, 1017, 936, 703, 487, 175, 339, 41,
+    387, 860, 824, 652, 389, 624, 494, 37, 202, 758, 306, 805, 107, 794, 771, 227,
+    593, 846, 555, 723, 420, 360, 16, 211, 926, 592, 978, 35, 439, 1013, 282, 554,
+    563, 864, 853, 711, 329, 664, 330, 722, 64, 767, 303, 961, 547, 282, 1013, 180,
+    939, 7, 224, 860, 633, 328, 231, 69, 782, 513, 609, 528, 373, 41, 663, 356,
+    559, 1007, 147, 797, 253, 828, 655, 777, 205, 732, 989, 394, 194, 25, 414, 108,
+    453, 558, 815, 434, 234, 626, 387, 631, 338, 907, 78, 999, 696, 705, 477, 978,
+    884, 955, 482, 679, 625, 809, 561, 513, 735, 973, 940, 39, 745, 313, 293, 698,
+    627, 79, 920, 153, 672, 555, 569, 808, 257, 172, 9, 755, 59, 770, 167, 899,
+    231, 746, 386, 19, 898, 406, 452, 804, 770, 437, 131, 759, 277, 490, 821, 806,
+    12, 347, 140, 818, 815, 1014, 857, 827, 464, 964, 208, 772, 71, 65, 835, 798,
+    774, 888, 332, 1013, 751, 167, 218, 896, 863, 743, 683, 365, 193, 502, 569, 373,
+    624, 397, 383, 716, 407, 701, 795, 23, 389, 737, 1006, 217, 660, 1005, 477, 753,
+    550, 338, 24, 563, 279, 896, 626, 478, 835, 829, 307, 231, 426, 928, 339, 625,
+    902, 198, 166, 453, 977, 490, 655, 169, 885, 41, 370, 814, 650, 959, 827, 337,
+    112, 938, 282, 551, 610, 202, 973, 932, 629, 1003, 443, 338, 329, 734, 626, 251,
+    244, 593, 407, 154, 105, 789, 349, 740, 332, 499, 605, 905, 443, 83, 693, 531,
+    393, 433, 112, 157, 138, 614, 188, 52, 903, 477, 65, 433, 938, 219, 747, 69,
+    636, 959, 383, 117, 229, 88, 0, 427, 753, 912, 141, 737, 664, 538, 238, 205,
+    78, 82, 377, 364, 41, 453, 648, 129, 589, 139, 588, 429, 358, 998, 624, 118,
+    673, 971, 838, 161, 186, 996, 976, 116, 715, 12, 81, 3, 578, 971, 867, 390,
+    745, 777, 935, 956, 996, 712, 58, 248, 589, 952, 3, 706, 794, 10, 307, 422,
+    584, 445, 138, 198, 281, 56, 960, 429, 255, 418, 133, 749, 897, 814, 424, 231,
+    358, 687, 1021, 664, 551, 46, 846, 448, 361, 36, 966, 519, 121, 674, 243, 5,
+    116, 687, 897, 952, 266, 107, 23, 214, 601, 558, 51, 484, 610, 554, 623, 233,
+    940, 304, 21, 373, 225, 187, 911, 502, 986, 725, 552, 721, 420, 662, 165, 726,
+    522, 258, 569, 535, 250, 276, 852, 909, 334, 151, 446, 573, 873, 999, 157, 366,
+    522, 631, 670, 815, 547, 865, 969, 290, 397, 953, 68, 293, 665, 681, 998, 943,
+    522, 258, 904, 341, 726, 573, 793, 431, 363, 279, 957, 896, 800, 6, 443, 549,
+    522, 355, 474, 148, 909, 367, 303, 233, 397, 573, 622, 978, 112, 330, 272, 20,
+    830, 344, 609, 85, 742, 18, 871, 632, 465, 651, 269, 809, 807, 343, 153, 470,
+    760, 73, 241, 326, 415, 44, 343, 806, 421, 733, 485, 989, 635, 786, 959, 26,
+    653, 632, 860, 748, 455, 143, 49, 233, 244, 388, 30, 318, 362, 584, 850, 533,
+    605, 460, 153, 544, 484, 615, 669, 203, 450, 638, 969, 363, 262, 889, 507, 1000,
+    82, 292, 704, 788, 453, 144, 390, 425, 204, 196, 1014, 538, 865, 910, 178, 264,
+    503, 985, 68, 969, 295, 821, 850, 874, 66, 644, 165, 751, 652, 132, 318, 486,
+    92, 162, 180, 582, 603, 465, 959, 453, 202, 919, 316, 691, 506, 393, 792, 254,
+    225, 1004, 501, 957, 454, 159, 801, 90, 200, 847, 855, 967, 277, 76, 526, 255,
+    457, 974, 97, 674, 565, 803, 268, 469, 385, 895, 969, 1007, 862, 327, 122, 733,
+    183, 144, 492, 12, 570, 660, 207, 996, 998, 462, 485, 958, 558, 838, 272, 14,
+    733, 633, 557, 117, 334, 41, 1012, 694, 12, 286, 88, 44, 1007, 665, 185, 837,
+    796, 7, 7, 46, 548, 846, 88, 1008, 272, 541, 21, 179, 727, 693, 967, 950,
+    158, 743, 122, 41, 7, 280, 191, 839, 825, 395, 408, 758, 537, 903, 612, 312,
+    64, 355, 107, 91, 836, 845, 900, 659, 1009, 201, 727, 1019, 742, 90, 157, 424,
+    1002, 304, 21, 759, 803, 482, 422, 575, 397, 786, 466, 614, 611, 838, 1017, 98,
+    522, 631, 474, 179, 301, 272, 825, 208, 759, 649, 500, 933, 723, 480, 89, 622,
+    522, 666, 371, 179, 909, 180, 740, 2, 759, 396, 634, 854, 225, 689, 32, 281,
+    522, 258, 576, 341, 686, 302, 1019, 131, 799, 953, 757, 144, 592, 999, 664, 40,
+    825, 933, 493, 628, 898, 210, 384, 364, 391, 890, 831, 212, 488, 776, 177, 774,
+    64, 35, 672, 178, 270, 721, 934, 876, 961, 736, 778, 53, 925, 987, 212, 819,
+    64, 841, 107, 565, 448, 99, 1004, 557, 596, 37, 403, 168, 128, 102, 565, 705,
+    64, 841, 107, 220, 686, 251, 588, 733, 1016, 669, 330, 967, 110, 821, 600, 153,
+    522, 666, 144, 449, 243, 58, 384, 515, 438, 994, 400, 166, 838, 648, 226, 165,
+    522, 494, 485, 297, 460, 180, 467, 346, 116, 786, 838, 923, 194, 113, 520, 548,
+    11, 188, 931, 627, 505, 410, 46, 368, 484, 1008, 545, 361, 736, 381, 763, 641,
+    129, 484, 881, 641, 227, 587, 19, 977, 825, 759, 996, 13, 531, 690, 944, 551,
+    882, 431, 301, 491, 493, 461, 135, 153, 325, 144, 221, 937, 143, 57, 371, 661,
+    392, 974, 859, 978, 58, 500, 153, 492, 133, 368, 990, 333, 270, 662, 709, 641,
+    474, 904, 1012, 549, 320, 216, 101, 117, 199, 740, 685, 75, 296, 996, 874, 48,
+    1020, 210, 660, 614, 621, 267, 305, 261, 283, 748, 24, 884, 172, 32, 348, 675,
+    107, 828, 120, 479, 1021, 587, 244, 654, 462, 821, 1023, 166, 44, 604, 373, 899,
+    656, 779, 299, 809, 373, 916, 465, 582, 1020, 115, 1009, 3, 788, 44, 840, 879,
+    652, 960, 562, 55, 627, 764, 660, 97, 240, 958, 526, 956, 889, 151, 137, 789,
+    337, 919, 190, 813, 186, 474, 441, 906, 408, 741, 143, 564, 362, 366, 332, 989,
+    118, 107, 185, 67, 554, 146, 31, 349, 548, 237, 503, 429, 820, 103, 167, 454,
+    67, 251, 845, 321, 184, 752, 540, 678, 768, 468, 646, 81, 256, 817, 986, 342,
+    494, 349, 524, 629, 31, 505, 222, 417, 300, 433, 827, 103, 802, 589, 731, 71,
+    136, 756, 28, 584, 214, 388, 946, 245, 175, 120, 839, 689, 702, 313, 158, 771,
+    160, 902, 270, 381, 978, 152, 465, 694, 257, 544, 649, 142, 1019, 442, 409, 211,
+};
+
+#define REF_FRAMES_JUNHAO 98
+
+/* ---------------------------------------------------------------------------
+ * 7. 推理
+ * -------------------------------------------------------------------------*/
+typedef struct {
+    Session prefill;
+    Session decode;
+    Session frame;
+    Session enc;      /* codec encode (可选, 声音克隆) */
+    Session dec;      /* codec decode_full */
+} Models;
+
+static void models_open(Models* m, const wchar_t* dir, int threads)
+{
+    memset(m, 0, sizeof(*m));
+    ort_load();
+
+    /* --- prefill: input_ids[1,S,17], attention_mask[1,S] -> hidden + 12*(k,v) --- */
+    m->prefill.n_in = 2;
+    strcpy(m->prefill.in_name[0], "input_ids");
+    strcpy(m->prefill.in_name[1], "attention_mask");
+    m->prefill.n_out = 1 + GLOBAL_LAYERS * 2;
+    strcpy(m->prefill.out_name[0], "global_hidden");
+    for (int i = 0; i < GLOBAL_LAYERS; i++) {
+        sprintf(m->prefill.out_name[1 + i * 2], "present_key_%d", i);
+        sprintf(m->prefill.out_name[2 + i * 2], "present_value_%d", i);
+    }
+
+    /* --- decode_step: 同 prefill 的输出, 加上 past_* --- */
+    m->decode.n_in = 2 + GLOBAL_LAYERS * 2;
+    strcpy(m->decode.in_name[0], "input_ids");
+    strcpy(m->decode.in_name[1], "past_valid_lengths");
+    for (int i = 0; i < GLOBAL_LAYERS; i++) {
+        sprintf(m->decode.in_name[2 + i * 2], "past_key_%d", i);
+        sprintf(m->decode.in_name[3 + i * 2], "past_value_%d", i);
+    }
+    m->decode.n_out = 1 + GLOBAL_LAYERS * 2;
+    strcpy(m->decode.out_name[0], "global_hidden");
+    for (int i = 0; i < GLOBAL_LAYERS; i++) {
+        sprintf(m->decode.out_name[1 + i * 2], "present_key_%d", i);
+        sprintf(m->decode.out_name[2 + i * 2], "present_value_%d", i);
+    }
+
+    /* --- local_fixed_sampled_frame --- */
+    m->frame.n_in = 4;
+    strcpy(m->frame.in_name[0], "global_hidden");
+    strcpy(m->frame.in_name[1], "repetition_seen_mask");
+    strcpy(m->frame.in_name[2], "assistant_random_u");
+    strcpy(m->frame.in_name[3], "audio_random_u");
+    m->frame.n_out = 2;
+    strcpy(m->frame.out_name[0], "should_continue");
+    strcpy(m->frame.out_name[1], "frame_token_ids");
+
+    /* --- codec --- */
+    m->enc.n_in = 2;
+    strcpy(m->enc.in_name[0], "waveform");
+    strcpy(m->enc.in_name[1], "input_lengths");
+    m->enc.n_out = 2;
+    strcpy(m->enc.out_name[0], "audio_codes");
+    strcpy(m->enc.out_name[1], "audio_code_lengths");
+
+    m->dec.n_in = 2;
+    strcpy(m->dec.in_name[0], "audio_codes");
+    strcpy(m->dec.in_name[1], "audio_code_lengths");
+    m->dec.n_out = 2;
+    strcpy(m->dec.out_name[0], "audio");
+    strcpy(m->dec.out_name[1], "audio_lengths");
+
+    for (int k = 0; k < 32; k++) {
+        m->prefill.in_ptr[k] = m->prefill.in_name[k];
+        m->prefill.out_ptr[k] = m->prefill.out_name[k];
+        m->decode.in_ptr[k] = m->decode.in_name[k];
+        m->decode.out_ptr[k] = m->decode.out_name[k];
+        m->frame.in_ptr[k] = m->frame.in_name[k];
+        m->frame.out_ptr[k] = m->frame.out_name[k];
+        m->enc.in_ptr[k] = m->enc.in_name[k];
+        m->enc.out_ptr[k] = m->enc.out_name[k];
+        m->dec.in_ptr[k] = m->dec.in_name[k];
+        m->dec.out_ptr[k] = m->dec.out_name[k];
+    }
+
+    sess_open(&m->prefill, dir, L"moss_tts_prefill.onnx", threads);
+    sess_open(&m->decode, dir, L"moss_tts_decode_step.onnx", threads);
+    sess_open(&m->frame, dir, L"moss_tts_local_fixed_sampled_frame.onnx", threads);
+    sess_open(&m->dec, dir, L"moss_audio_tokenizer_decode_full.onnx", threads);
+    sess_open(&m->enc, dir, L"moss_audio_tokenizer_encode.onnx", threads);
+}
+
+/* 语音结束检测 (对应 Rust EndOfSpeechDetector, 但窗口从 8 帧放宽到 48 帧)。
+ *
+ * 原实现用 8 帧 (0.64s) 判断第一通道重复率, 会把句子之间的停顿误判成结束:
+ * 实测一句 50 字的中文在 step 31 就被截断 (模型其实还有 100 多帧要说),
+ * 英文 "Hello world." 后面也有近 2 秒的自然停顿。
+ * 48 帧 = 3.8 秒, 正常停顿远达不到, 而真正说完之后的静音会一直持续下去,
+ * 所以既能自动收尾, 又不会把话说一半就掐掉。 */
+typedef struct {
+    int32_t frames[EOS_WINDOW][N_VQ];
+    int n;
+} EosDetector;
+
+static int eos_check(EosDetector* d, const int32_t* frame, int step)
+{
+    (void)step;
+    if (d->n < EOS_WINDOW) {
+        memcpy(d->frames[d->n], frame, sizeof(int32_t) * N_VQ);
+        d->n++;
+    } else {
+        memmove(d->frames[0], d->frames[1], sizeof(d->frames[0]) * (EOS_WINDOW - 1));
+        memcpy(d->frames[EOS_WINDOW - 1], frame, sizeof(int32_t) * N_VQ);
+    }
+    if (d->n < EOS_WINDOW) return 0;
+
+    /* 1) 整窗完全一致: 模型卡死在同一个 token 上 */
+    int same = 1;
+    for (int k = 1; k < EOS_WINDOW && same; k++)
+        if (memcmp(d->frames[k], d->frames[0], sizeof(int32_t) * N_VQ) != 0) same = 0;
+    if (same) return 1;
+
+    /* 2) 第一通道重复率 > 0.75: 静音段的典型特征 */
+    int dom = d->frames[0][0], cnt = 0;
+    for (int k = 0; k < EOS_WINDOW; k++) if (d->frames[k][0] == dom) cnt++;
+    if ((float)cnt / (float)EOS_WINDOW > 0.75f) return 1;
+
+    /* 3) 第一通道只有 <= 2 种取值: 来回抖动, 同样视为静音 */
+    int uniq[EOS_WINDOW], nu = 0;
+    for (int k = 0; k < EOS_WINDOW; k++) {
+        int seen = 0;
+        for (int j = 0; j < nu; j++) if (uniq[j] == d->frames[k][0]) { seen = 1; break; }
+        if (!seen) uniq[nu++] = d->frames[k][0];
+    }
+    if (nu <= 2) return 1;
+
+    return 0;
+}
+
+/* 定义在 codec_decode 之后: 解码一小段并返回均方能量 (用于判断是否已说完) */
+static double codec_probe_energy(Models* m, const int16_t* codes, size_t frames);
+
+/* 生成音频帧; 返回帧数, *codes 为 frames*16 的 token */
+static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
+                              const int16_t* ref, size_t ref_frames,
+                              int16_t** codes, uint64_t seed, int max_frames,
+                              int verbose, int use_eos, const wchar_t* dump_frames)
+{
+    size_t S = (size_t)12 + 1 + ref_frames + 1 + 56 + n_text + 6 + 1;
+
+    int32_t* ids = (int32_t*)xmalloc(sizeof(int32_t) * S * ROW_WIDTH);
+    int32_t* amask = (int32_t*)xmalloc(sizeof(int32_t) * S);
+    size_t r = 0;
+
+#define PUSH_TEXT_ROW(tok)                                                    \
+    do {                                                                      \
+        int32_t* _row = ids + r * ROW_WIDTH;                                   \
+        _row[0] = (tok);                                                       \
+        for (int _c = 0; _c < N_VQ; _c++) _row[1 + _c] = AUDIO_PAD_TOKEN;      \
+        amask[r] = 1;                                                          \
+        r++;                                                                   \
+    } while (0)
+
+    for (int k = 0; k < 12; k++) PUSH_TEXT_ROW(k_user_prefix[k]);
+    PUSH_TEXT_ROW(AUDIO_START_TOKEN);
+
+    for (size_t f = 0; f < ref_frames; f++) {
+        int32_t* row = ids + r * ROW_WIDTH;
+        row[0] = AUDIO_USER_SLOT;
+        for (int c = 0; c < N_VQ; c++) row[1 + c] = ref[f * N_VQ + c];
+        amask[r] = 1;
+        r++;
+    }
+
+    PUSH_TEXT_ROW(AUDIO_END_TOKEN);
+    for (int k = 0; k < 56; k++) PUSH_TEXT_ROW(k_after_ref[k]);
+    for (size_t k = 0; k < n_text; k++) PUSH_TEXT_ROW(text_ids[k]);
+    for (int k = 0; k < 6; k++) PUSH_TEXT_ROW(k_asst_prefix[k]);
+    PUSH_TEXT_ROW(AUDIO_START_TOKEN);
+#undef PUSH_TEXT_ROW
+
+    S = r;
+
+    /* ---- prefill ---- */
+    int64_t sh_ids[3] = { 1, (int64_t)S, ROW_WIDTH };
+    int64_t sh_msk[2] = { 1, (int64_t)S };
+    OrtValue* pin[2] = {0};
+    pin[0] = MK_I32(ids, sh_ids, 3);
+    pin[1] = MK_I32(amask, sh_msk, 2);
+
+    /* 重要: outputs 数组必须清零, 否则 ORT 会把栈上的垃圾值当作已有
+     * OrtValue 去增减引用计数 -> 访问违例 (输出个数多时必现) */
+    OrtValue* pout[32] = {0};
+    if (verbose) fprintf(stderr, "  prefill: seq=%zu\n", S);
+    sess_run(&m->prefill, pin, pout);
+
+    float* hidden_all = NULL;
+    size_t hn = 0;
+    hidden_all = (float*)tensor_data(pout[0], &hn);
+    if (hn < (size_t)HIDDEN) die("prefill returned no hidden states");
+
+    float hidden[HIDDEN];
+    memcpy(hidden, hidden_all + (S - 1) * HIDDEN, sizeof(float) * HIDDEN);
+
+    ort->ReleaseValue(pout[0]);
+    pout[0] = NULL;
+
+    OrtValue* kv[GLOBAL_LAYERS * 2];
+    for (int k = 0; k < GLOBAL_LAYERS * 2; k++) kv[k] = pout[1 + k];
+
+    ort->ReleaseValue(pin[0]);
+    ort->ReleaseValue(pin[1]);
+    free(ids);
+    free(amask);
+
+    /* ---- 自回归帧循环 ---- */
+    Rng rng; rng_seed(&rng, seed);
+    EosDetector eos; memset(&eos, 0, sizeof(eos));
+
+    uint8_t seen[N_VQ][AUDIO_CODEBOOK];
+    memset(seen, 0, sizeof(seen));
+
+    int32_t* mask = (int32_t*)xcalloc((size_t)N_VQ * AUDIO_CODEBOOK, sizeof(int32_t));
+    int64_t sh_mask[3] = { 1, N_VQ, AUDIO_CODEBOOK };
+    int64_t sh_hid[2] = { 1, HIDDEN };
+    int64_t sh_one[1] = { 1 };
+    int64_t sh_rand[2] = { 1, N_VQ };
+
+    float* u_asst = (float*)xmalloc(sizeof(float));
+    float* u_audio = (float*)xmalloc(sizeof(float) * N_VQ);
+
+    int32_t* step_ids = (int32_t*)xmalloc(sizeof(int32_t) * ROW_WIDTH);
+    int64_t sh_step[3] = { 1, 1, ROW_WIDTH };
+    int32_t* pvl_buf = (int32_t*)xmalloc(sizeof(int32_t));
+    int64_t sh_pvl[1] = { 1 };
+
+    int32_t past_len = (int32_t)S;
+    int silent_probes = 0;
+
+    int16_t* out = (int16_t*)xmalloc(sizeof(int16_t) * (size_t)max_frames * N_VQ);
+    size_t n_frames = 0;
+
+    for (int step = 0; step < max_frames; step++) {
+        /* 重建 repetition mask */
+        memset(mask, 0, sizeof(int32_t) * (size_t)N_VQ * AUDIO_CODEBOOK);
+        for (int c = 0; c < N_VQ; c++) {
+            int32_t* row = mask + (size_t)c * AUDIO_CODEBOOK;
+            for (int t = 0; t < AUDIO_CODEBOOK; t++) if (seen[c][t]) row[t] = 1;
+        }
+
+        u_asst[0] = rng_u(&rng);
+        for (int c = 0; c < N_VQ; c++) u_audio[c] = rng_u(&rng);
+
+        OrtValue* fin[4] = {0};
+        fin[0] = MK_F32(hidden, sh_hid, 2);
+        fin[1] = MK_I32(mask, sh_mask, 3);
+        fin[2] = MK_F32(u_asst, sh_one, 1);
+        fin[3] = MK_F32(u_audio, sh_rand, 2);
+
+        OrtValue* fout[2] = { NULL, NULL };
+        sess_run(&m->frame, fin, fout);
+
+        size_t scn = 0, ffn = 0;
+        int32_t* sc = (int32_t*)tensor_data(fout[0], &scn);
+        int32_t* fr = (int32_t*)tensor_data(fout[1], &ffn);
+        int32_t frame[N_VQ];
+        int keep = (sc && scn > 0 && sc[0] != 0);
+        for (int c = 0; c < N_VQ; c++) frame[c] = (c < (int)ffn) ? fr[c] : 0;
+
+        for (int k = 0; k < 4; k++) ort->ReleaseValue(fin[k]);
+        ort->ReleaseValue(fout[0]);
+        ort->ReleaseValue(fout[1]);
+
+        if (!keep) {
+            if (verbose) fprintf(stderr, "  [step %d] should_continue=0, stop\n", step);
+            break;
+        }
+
+        /* 记录已见 token */
+        for (int c = 0; c < N_VQ; c++) {
+            int t = frame[c];
+            if (t >= 0 && t < AUDIO_CODEBOOK) seen[c][t] = 1;
+        }
+
+        if (use_eos && eos_check(&eos, frame, step)) {
+            if (verbose) fprintf(stderr, "  [step %d] degenerate loop detected\n", step);
+            break;
+        }
+
+        for (int c = 0; c < N_VQ; c++) out[n_frames * N_VQ + c] = (int16_t)frame[c];
+        n_frames++;
+
+        /* 每 16 帧把尾部 8 帧解码出来看能量: 模型说完之后会一直吐静音,
+         * 但 should_continue 不一定变 0, 用能量判断才能真正收尾。 */
+        if (n_frames >= 24 && (n_frames % 16) == 0) {
+            double e = codec_probe_energy(m, out + (n_frames - 8) * N_VQ, 8);
+            if (e < 1.0e-5) {
+                if (++silent_probes >= 2) {
+                    if (verbose) fprintf(stderr, "  [step %d] trailing silence, stop\n", step);
+                    break;
+                }
+            } else {
+                silent_probes = 0;
+            }
+        }
+
+        /* decode_step 推进全局 hidden + KV */
+        step_ids[0] = AUDIO_ASST_SLOT;
+        for (int c = 0; c < N_VQ; c++) step_ids[1 + c] = frame[c];
+        pvl_buf[0] = past_len;
+
+        OrtValue* din[32] = {0};
+        din[0] = MK_I32(step_ids, sh_step, 3);
+        din[1] = MK_I32(pvl_buf, sh_pvl, 1);
+        for (int k = 0; k < GLOBAL_LAYERS * 2; k++) din[2 + k] = kv[k];
+
+        OrtValue* dout[32] = {0};
+        sess_run(&m->decode, din, dout);
+
+        size_t dn = 0;
+        float* dh = (float*)tensor_data(dout[0], &dn);
+        if (dn >= (size_t)HIDDEN) memcpy(hidden, dh + dn - HIDDEN, sizeof(float) * HIDDEN);
+
+        ort->ReleaseValue(dout[0]);
+        ort->ReleaseValue(din[0]);
+        ort->ReleaseValue(din[1]);
+        for (int k = 0; k < GLOBAL_LAYERS * 2; k++) ort->ReleaseValue(kv[k]);
+        for (int k = 0; k < GLOBAL_LAYERS * 2; k++) kv[k] = dout[1 + k];
+
+        past_len++;
+
+        if (verbose && (step % 25 == 0))
+            fprintf(stderr, "  frame %d/%d\n", step + 1, max_frames);
+    }
+
+    if (dump_frames && dump_frames[0]) {
+        FILE* df = _wfopen(dump_frames, L"w");
+        if (df) {
+            for (size_t k = 0; k < n_frames; k++) {
+                for (int c = 0; c < N_VQ; c++) fprintf(df, "%d%s", out[k * N_VQ + c], c + 1 < N_VQ ? " " : "\n");
+            }
+            fclose(df);
+        }
+    }
+
+    for (int k = 0; k < GLOBAL_LAYERS * 2; k++) ort->ReleaseValue(kv[k]);
+    free(mask); free(u_asst); free(u_audio);
+    free(step_ids); free(pvl_buf);
+
+    *codes = out;
+    return n_frames;
+}
+
+/* codec 解码: 返回交错立体声 float */
+static float* codec_decode(Models* m, const int16_t* codes, size_t frames, size_t* out_samples)
+{
+    int32_t* ac = (int32_t*)xmalloc(sizeof(int32_t) * frames * N_VQ);
+    for (size_t k = 0; k < frames * N_VQ; k++) ac[k] = codes[k];
+
+    int32_t len_buf = (int32_t)frames;
+    int64_t sh_codes[3] = { 1, (int64_t)frames, N_VQ };
+    int64_t sh_len[1] = { 1 };
+
+    OrtValue* in[2] = {0};
+    in[0] = MK_I32(ac, sh_codes, 3);
+    in[1] = MK_I32(&len_buf, sh_len, 1);
+
+    OrtValue* outv[2] = { NULL, NULL };
+    sess_run(&m->dec, in, outv);
+
+    size_t total = 0;
+    float* audio = (float*)tensor_data(outv[0], &total);
+    size_t alen = 0;
+    int32_t* al = (int32_t*)tensor_data(outv[1], &alen);
+    if (!al || alen < 1 || al[0] <= 0) die("codec decode returned bad audio_lengths");
+
+    size_t per_ch = (size_t)al[0];
+    size_t n_ch = total / per_ch;
+    if (n_ch == 0) die("codec decode returned no audio");
+
+    float* inter = (float*)xmalloc(sizeof(float) * per_ch * n_ch);
+    for (size_t s = 0; s < per_ch; s++)
+        for (size_t c = 0; c < n_ch; c++)
+            inter[s * n_ch + c] = audio[c * per_ch + s];
+
+    ort->ReleaseValue(outv[0]);
+    ort->ReleaseValue(outv[1]);
+    ort->ReleaseValue(in[0]);
+    ort->ReleaseValue(in[1]);
+    free(ac);
+
+    *out_samples = per_ch;
+    return inter;
+}
+
+/* 解码一小段 codes 并返回均方能量 (不用开方, 直接比平方) */
+static double codec_probe_energy(Models* m, const int16_t* codes, size_t frames)
+{
+    size_t n = 0;
+    float* pcm = codec_decode(m, codes, frames, &n);
+    if (!pcm || n == 0) { free(pcm); return 0.0; }
+    double acc = 0.0;
+    for (size_t i = 0; i < n * CHANNELS; i++) acc += (double)pcm[i] * (double)pcm[i];
+    free(pcm);
+    return acc / (double)(n * CHANNELS);
+}
+
+/* codec 编码: 参考音频 -> codes */
+static int16_t* codec_encode(Models* m, const float* interleaved, size_t frames, size_t* out_frames)
+{
+    float* planar = (float*)xmalloc(sizeof(float) * frames * CHANNELS);
+    for (size_t s = 0; s < frames; s++)
+        for (int c = 0; c < CHANNELS; c++)
+            planar[c * frames + s] = interleaved[s * CHANNELS + c];
+
+    int32_t len_buf = (int32_t)frames;
+    int64_t sh_wav[3] = { 1, CHANNELS, (int64_t)frames };
+    int64_t sh_len[1] = { 1 };
+
+    OrtValue* in[2] = {0};
+    in[0] = MK_F32(planar, sh_wav, 3);
+    in[1] = MK_I32(&len_buf, sh_len, 1);
+
+    OrtValue* outv[2] = { NULL, NULL };
+    sess_run(&m->enc, in, outv);
+
+    size_t total = 0;
+    int32_t* ac = (int32_t*)tensor_data(outv[0], &total);
+    size_t ln = 0;
+    int32_t* al = (int32_t*)tensor_data(outv[1], &ln);
+    size_t nf = (al && ln > 0 && al[0] > 0) ? (size_t)al[0] : (total / N_VQ);
+    if (nf * N_VQ > total) nf = total / N_VQ;
+
+    int16_t* codes = (int16_t*)xmalloc(sizeof(int16_t) * nf * N_VQ);
+    for (size_t k = 0; k < nf * N_VQ; k++) codes[k] = (int16_t)ac[k];
+
+    ort->ReleaseValue(outv[0]);
+    ort->ReleaseValue(outv[1]);
+    ort->ReleaseValue(in[0]);
+    ort->ReleaseValue(in[1]);
+    free(planar);
+
+    *out_frames = nf;
+    return codes;
+}
+
+/* ---------------------------------------------------------------------------
+ * 8. 文本分块 (按句末标点, 控制每次 prefill 的 token 数)
+ * -------------------------------------------------------------------------*/
+#define MAX_TEXT_TOKENS 100
+
+static int is_sentence_end(uint32_t c)
+{
+    return c == '.' || c == '!' || c == '?' || c == ';' ||
+           c == 0x3002 || c == 0xFF01 || c == 0xFF1F || c == 0xFF1B || c == 0xFF1A;
+}
+
+/* 把 text 切成若干块; 返回块数, 结果写入 out (每块 malloc) */
+static int split_chunks(const SP* sp, const char* text, char*** out, int max_tokens)
+{
+    size_t n = strlen(text);
+    /* 先按句末标点切段 */
+    char** seg = (char**)xmalloc(sizeof(char*) * (n + 2));
+    int nseg = 0;
+    size_t start = 0, i = 0;
+    while (i < n) {
+        int cl;
+        uint32_t c = utf8_dec((const unsigned char*)text + i, &cl);
+        i += (size_t)cl;
+        if (is_sentence_end(c)) {
+            /* 吸收紧跟的结束引号 */
+            while (i < n) {
+                int cl2;
+                uint32_t c2 = utf8_dec((const unsigned char*)text + i, &cl2);
+                if (c2 == '"' || c2 == '\'' || c2 == ')' || c2 == ']' || c2 == '}' ||
+                    c2 == 0x300D || c2 == 0x300F || c2 == 0xFF09 || c2 == 0x3011 || c2 == 0x300B)
+                    i += (size_t)cl2;
+                else break;
+            }
+            size_t len = i - start;
+            char* s = (char*)xmalloc(len + 1);
+            memcpy(s, text + start, len);
+            s[len] = 0;
+            /* trim */
+            char* p = s;
+            while (*p == ' ') p++;
+            size_t pl = strlen(p);
+            while (pl > 0 && p[pl - 1] == ' ') p[--pl] = 0;
+            if (pl > 0) { if (p != s) memmove(s, p, pl + 1); seg[nseg++] = s; }
+            else free(s);
+            while (i < n && text[i] == ' ') i++;
+            start = i;
+        }
+    }
+    if (start < n) {
+        size_t len = n - start;
+        char* s = (char*)xmalloc(len + 1);
+        memcpy(s, text + start, len);
+        s[len] = 0;
+        char* p = s;
+        while (*p == ' ') p++;
+        size_t pl = strlen(p);
+        while (pl > 0 && p[pl - 1] == ' ') p[--pl] = 0;
+        if (pl > 0) { if (p != s) memmove(s, p, pl + 1); seg[nseg++] = s; } else free(s);
+    }
+
+    char** chunks = (char**)xmalloc(sizeof(char*) * (size_t)(nseg + 1));
+    int nch = 0;
+    char cur[8192];
+    cur[0] = 0;
+
+    for (int k = 0; k < nseg; k++) {
+        if (cur[0] == 0) {
+            _snprintf(cur, sizeof(cur), "%s", seg[k]);
+            free(seg[k]);
+            continue;
+        }
+        char joined[8192];
+        int cjk = text_has_cjk(cur) || text_has_cjk(seg[k]);
+        _snprintf(joined, sizeof(joined), cjk ? "%s%s" : "%s %s", cur, seg[k]);
+        if (sp_count(sp, joined) <= max_tokens) {
+            strcpy(cur, joined);
+            free(seg[k]);
+        } else {
+            chunks[nch++] = _strdup(cur);
+            _snprintf(cur, sizeof(cur), "%s", seg[k]);
+            free(seg[k]);
+        }
+    }
+    if (cur[0]) chunks[nch++] = _strdup(cur);
+    free(seg);
+
+    *out = chunks;
+    return nch;
+}
+
+/* ---------------------------------------------------------------------------
+ * 9. main
+ * -------------------------------------------------------------------------*/
+/* 崩溃时打印出错模块, 方便定位 (ONNX Runtime 内部崩溃时很有用) */
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep)
+{
+    void* addr = (void*)ep->ExceptionRecord->ExceptionAddress;
+    HMODULE mod = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)addr, &mod) && mod)
+        GetModuleFileNameA(mod, name, MAX_PATH);
+    fprintf(stderr, "[crash] code=0x%08lX addr=%p module=%s\n",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode, addr, name);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static void usage(void)
+{
+    printf(
+        "MOSS-TTS-Nano 单文件 C 推理\n"
+        "\n"
+        "用法: moss_tts [文本] [选项]\n"
+        "\n"
+        "  --out <file>        输出 wav (默认 out.wav)\n"
+        "  --model-dir <dir>   模型目录 (默认 models)\n"
+        "  --ref-wav <file>    参考音频, 做声音克隆 (默认用内置音色 Junhao)\n"
+        "  --seed <n>          随机种子 (默认 1234)\n"
+        "  --max-frames <n>    单块最大帧数 (默认 375, 12.5 帧/秒)\n"
+        "  --threads <n>       ONNX 线程数 (默认 4, 实测再多反而更慢)\n"
+        "  --tokens            只打印分词结果\n"
+        "  --verbose           打印生成过程\n"
+        "  --no-eos            关闭 token 重复检测 (只依赖能量判据)\n"
+        "  --dump-frames <f>   把生成的帧 token 导出成文本 (调试用)\n"
+        "  -h, --help          帮助\n");
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    SetConsoleOutputCP(CP_UTF8);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    SetUnhandledExceptionFilter(crash_filter);
+
+    char* text = NULL;
+    wchar_t out_path[MAX_PATH] = L"out.wav";
+    wchar_t model_dir[MAX_PATH] = L"models";
+    wchar_t ref_wav[MAX_PATH] = L"";
+    uint64_t seed = 1234;
+    int max_frames = MAX_FRAMES_DEF;
+    int tokens_only = 0, verbose = 0, no_eos = 0;
+    wchar_t dump_frames[MAX_PATH] = L"";
+    int threads = 0;
+
+    /* 文本: 拼接所有非选项参数 */
+    {
+        size_t cap = 4096, used = 0;
+        text = (char*)xcalloc(cap, 1);
+        for (int i = 1; i < argc; i++) {
+            const wchar_t* a = argv[i];
+            if (a[0] == L'-') {
+                if (!wcscmp(a, L"--out") && i + 1 < argc) { wcscpy(out_path, argv[++i]); }
+                else if (!wcscmp(a, L"--model-dir") && i + 1 < argc) { wcscpy(model_dir, argv[++i]); }
+                else if (!wcscmp(a, L"--ref-wav") && i + 1 < argc) { wcscpy(ref_wav, argv[++i]); }
+                else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
+                else if (!wcscmp(a, L"--max-frames") && i + 1 < argc) { max_frames = _wtoi(argv[++i]); }
+                else if (!wcscmp(a, L"--threads") && i + 1 < argc) { threads = _wtoi(argv[++i]); }
+                else if (!wcscmp(a, L"--tokens")) { tokens_only = 1; }
+                else if (!wcscmp(a, L"--verbose")) { verbose = 1; }
+                else if (!wcscmp(a, L"--no-eos")) { no_eos = 1; }
+                else if (!wcscmp(a, L"--dump-frames") && i + 1 < argc) { wcscpy(dump_frames, argv[++i]); }
+                else if (!wcscmp(a, L"-h") || !wcscmp(a, L"--help")) { usage(); return 0; }
+                else {
+                    char* u = w2u(a);
+                    fprintf(stderr, "unknown option: %s\n", u ? u : "?");
+                    free(u);
+                    return 2;
+                }
+                continue;
+            }
+            char* u = w2u(a);
+            size_t ul = strlen(u);
+            if (used + ul + 2 > cap) {
+                cap = (used + ul + 2) * 2;
+                text = (char*)realloc(text, cap);
+                if (!text) die("out of memory");
+            }
+            if (used) text[used++] = ' ';
+            memcpy(text + used, u, ul);
+            used += ul;
+            text[used] = 0;
+            free(u);
+        }
+    }
+    if (text[0] == 0) {
+        free(text);
+        text = _strdup("\xE6\xAC\xA2\xE8\xBF\x8E\xE5\x85\xB3\xE6\xB3\xA8\xE6\xA8\xA1\xE6\x80\x9D"
+                       "\xE6\x99\xBA\xE8\x83\xBD\xEF\xBC\x8C\xE8\xBF\x99\xE6\x98\xAF MOSS-TTS-Nano "
+                       "\xE7\x9A\x84\xE7\xBA\xAF C \xE6\x8E\xA8\xE7\x90\x86\xE5\xAE\x9E\xE7\x8E\xB0\xE3\x80\x82");
+    }
+
+    if (threads <= 0) {
+        /* 实测: 这个 100M 模型在 4 线程附近最快; 线程开太多 (8/16) 会因为
+         * ORT 自旋等待 + 线程争抢而慢 3~5 倍。 */
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        threads = (int)si.dwNumberOfProcessors;
+        if (threads <= 0) threads = 4;
+        if (threads > 4) threads = 4;
+    }
+
+    /* ---- 分词器 ---- */
+    wchar_t tok_path[MAX_PATH * 2];
+    _snwprintf(tok_path, MAX_PATH * 2, L"%s\\tokenizer.model", model_dir);
+
+    uint64_t t0 = now_ms();
+    SP sp;
+    sp_load(&sp, tok_path);
+
+    char* norm = normalize_for_tts(text);
+    printf("text      : %s\n", norm);
+
+    if (tokens_only) {
+        int32_t* ids = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(norm) * 2 + 16));
+        int n = sp_encode(&sp, norm, ids, (int)strlen(norm) * 2 + 16);
+        printf("tokens(%d): [", n);
+        for (int k = 0; k < n; k++) printf("%s%d", k ? ", " : "", ids[k]);
+        printf("]\n");
+        free(ids); free(norm); free(text);
+        return 0;
+    }
+
+    /* ---- 参考音频 ---- */
+    const int16_t* ref = k_ref_codes_junhao;
+    size_t ref_frames = REF_FRAMES_JUNHAO;
+
+    Models models;
+    models_open(&models, model_dir, threads);
+
+    int16_t* ref_owned = NULL;
+    if (ref_wav[0]) {
+        size_t nfr = 0;
+        float* wav = wav_read_48k_stereo(ref_wav, &nfr);
+        if (!wav) die("cannot read --ref-wav (need 16-bit PCM or float32 wav)");
+        ref_owned = codec_encode(&models, wav, nfr, &ref_frames);
+        free(wav);
+        ref = ref_owned;
+        printf("ref-wav   : %zu frames\n", ref_frames);
+    } else {
+        printf("voice     : Junhao (%zu frames)\n", ref_frames);
+    }
+    printf("threads   : %d\n", threads);
+
+    /* ---- 分块合成 ---- */
+    char** chunks = NULL;
+    int nch = split_chunks(&sp, norm, &chunks, MAX_TEXT_TOKENS);
+
+    size_t total_samples = 0;
+    float* all = NULL;
+
+    for (int ci = 0; ci < nch; ci++) {
+        int32_t* tids = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(chunks[ci]) * 2 + 16));
+        int nt = sp_encode(&sp, chunks[ci], tids, (int)strlen(chunks[ci]) * 2 + 16);
+        if (nt <= 0) { free(tids); continue; }
+        if (verbose || nch > 1) printf("chunk %d/%d: %d tokens\n", ci + 1, nch, nt);
+
+        uint64_t t1 = now_ms();
+        int16_t* codes = NULL;
+        size_t frames = generate_frames(&models, tids, (size_t)nt, ref, ref_frames,
+                                        &codes, seed, max_frames, verbose, !no_eos, dump_frames);
+        uint64_t t2 = now_ms();
+        if (frames == 0) {
+            fprintf(stderr, "  [warn] no frames generated for this chunk\n");
+            free(codes); free(tids);
+            continue;
+        }
+
+        size_t nsamp = 0;
+        float* pcm = codec_decode(&models, codes, frames, &nsamp);
+        uint64_t t3 = now_ms();
+
+        printf("  %zu frames -> %.2f s audio  (gen %llu ms, decode %llu ms)\n",
+               frames, (double)nsamp / SAMPLE_RATE,
+               (unsigned long long)(t2 - t1), (unsigned long long)(t3 - t2));
+
+        size_t pause = 0;
+        if (ci + 1 < nch) pause = (size_t)(SAMPLE_RATE * 0.25);
+        float* merged = (float*)xmalloc(sizeof(float) * (total_samples + nsamp + pause) * CHANNELS);
+        if (all) {
+            memcpy(merged, all, sizeof(float) * total_samples * CHANNELS);
+            free(all);
+        }
+        memcpy(merged + total_samples * CHANNELS, pcm, sizeof(float) * nsamp * CHANNELS);
+        total_samples += nsamp;
+        if (pause) {
+            memset(merged + total_samples * CHANNELS, 0, sizeof(float) * pause * CHANNELS);
+            total_samples += pause;
+        }
+        all = merged;
+
+        free(pcm); free(codes); free(tids);
+    }
+
+    for (int k = 0; k < nch; k++) free(chunks[k]);
+    free(chunks);
+
+    if (!all || total_samples == 0) die("nothing generated");
+
+    /* 模型停止生成时会带上一段尾部静音 (EOS 检测需要 step>30 才触发),
+     * 这里把末尾超过 0.2s 的静音裁掉, 听感更自然。 */
+    {
+        size_t last = 0;
+        for (size_t i = total_samples; i > 0; i--) {
+            float l = all[(i - 1) * CHANNELS];
+            float r = all[(i - 1) * CHANNELS + 1];
+            if (l > 0.004f || l < -0.004f || r > 0.004f || r < -0.004f) { last = i; break; }
+        }
+        if (last > 0) {
+            size_t keep = last + (size_t)(SAMPLE_RATE * 0.2);
+            if (keep < total_samples) total_samples = keep;
+        }
+    }
+
+    wav_write_stereo(out_path, all, total_samples, CHANNELS, SAMPLE_RATE);
+
+    uint64_t t4 = now_ms();
+    char* op = w2u(out_path);
+    printf("\nwrote %s : %.2f s @ %d Hz stereo\n", op ? op : "?", (double)total_samples / SAMPLE_RATE, SAMPLE_RATE);
+    printf("total     : %llu ms\n", (unsigned long long)(t4 - t0));
+    free(op);
+
+    free(all);
+    free(ref_owned);
+    free(norm);
+    free(text);
+
+    if (g_meminfo) ort->ReleaseMemoryInfo(g_meminfo);
+    if (g_env) ort->ReleaseEnv(g_env);
+    return 0;
+}

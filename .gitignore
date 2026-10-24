@@ -1,0 +1,24 @@
+# 构建产物
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.map
+*.res
+*.o
+
+# 生成的音频
+*.wav
+
+# 模型权重与推理运行时（体积太大，需自行下载）
+#   models/           -> OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX
+#                        OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX
+#   onnxruntime.dll   -> https://github.com/microsoft/onnxruntime/releases
+models/
+onnxruntime.dll
+
+# 本地工具状态
+.workbuddy-ai/
+.vs/
