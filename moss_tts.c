@@ -1561,6 +1561,105 @@ static void player_on_audio(void* ctx, const float* inter, size_t n, int silent)
     player_push((Player*)ctx, inter, n, silent);
 }
 
+/* ---------------------------------------------------------------------------
+ * codec 解码异步化: sd_run 只消费已生成的帧, 与主循环的 frame/decode_step
+ * 无数据依赖 -> 挪到工作线程流水并行, 主循环每帧省 ~9ms (RTF 0.85 -> 0.74)。
+ * 结束判据用的批能量由工作线程发布, 主线程读到的最多滞后一批 (16 帧静音,
+ * 文件路径被尾部裁剪掐掉, 播放路径被 hold 丢弃, 语义不变)。
+ * -------------------------------------------------------------------------*/
+typedef struct {
+    Models*   m;
+    StreamDec sd;                        /* 工作线程独占 */
+    CRITICAL_SECTION cs;
+    HANDLE    wake;                      /* auto-reset: 有作业或要退出 */
+    HANDLE    th;
+    int16_t   job[MOSS_SD_BATCH * N_VQ]; /* 待取作业 (深度 1) */
+    int       job_n;
+    int       queued;
+    int       stop;
+    uint64_t* stat_ms;                   /* 解码耗时记账 */
+    volatile LONG published;             /* 发布给主线程的连续静音批数 */
+} Probe;
+
+static DWORD WINAPI probe_worker(LPVOID p)
+{
+    Probe* pr = (Probe*)p;
+    int consec = 0;
+    for (;;) {
+        WaitForSingleObject(pr->wake, INFINITE);
+        int16_t buf[MOSS_SD_BATCH * N_VQ];
+        int n = 0, stop = 0;
+        EnterCriticalSection(&pr->cs);
+        if (pr->queued) {
+            memcpy(buf, pr->job, sizeof(int16_t) * (size_t)pr->job_n * N_VQ);
+            n = pr->job_n;
+            pr->queued = 0;
+        }
+        stop = pr->stop && !pr->queued;
+        LeaveCriticalSection(&pr->cs);
+        if (n > 0) {
+            uint64_t t = now_ms();
+            sd_run(pr->m, &pr->sd, buf, (size_t)n);
+            if (pr->stat_ms) *pr->stat_ms += now_ms() - t;
+            consec = (pr->sd.last_energy < 1.0e-5) ? consec + 1 : 0;
+            InterlockedExchange(&pr->published, (LONG)consec);
+        }
+        if (stop) break;
+    }
+    return 0;
+}
+
+static void probe_start(Probe* pr, Models* m, Player* pl)
+{
+    memset(pr, 0, sizeof(*pr));
+    pr->m = m;
+    pr->stat_ms = &g_stats.probe;
+    sd_init(&pr->sd);
+    if (pl) {
+        pr->sd.cb = player_on_audio;
+        pr->sd.cb_ctx = pl;
+        player_begin(pl);
+    }
+    InitializeCriticalSection(&pr->cs);
+    pr->wake = CreateEvent(NULL, FALSE, FALSE, NULL);
+    pr->th = CreateThread(NULL, 0, probe_worker, pr, 0, NULL);
+    if (!pr->th || !pr->wake) die("cannot start probe worker");
+}
+
+/* 提交一批 (攒满或收尾时); 工作线程没取走上一批时等它取走 (背压) */
+static void probe_submit(Probe* pr, const int16_t* codes, int n)
+{
+    for (;;) {
+        EnterCriticalSection(&pr->cs);
+        if (!pr->queued) break;
+        LeaveCriticalSection(&pr->cs);
+        Sleep(1);
+    }
+    memcpy(pr->job, codes, sizeof(int16_t) * (size_t)n * N_VQ);
+    pr->job_n = n;
+    pr->queued = 1;
+    LeaveCriticalSection(&pr->cs);
+    SetEvent(pr->wake);
+}
+
+/* 收尾: 等工作线程把队列里的活干完, 交还累积的音频 */
+static float* probe_finish(Probe* pr, size_t* out_samples)
+{
+    EnterCriticalSection(&pr->cs);
+    pr->stop = 1;
+    LeaveCriticalSection(&pr->cs);
+    SetEvent(pr->wake);
+    WaitForSingleObject(pr->th, INFINITE);
+    CloseHandle(pr->th);
+    CloseHandle(pr->wake);
+    DeleteCriticalSection(&pr->cs);
+    float* pcm = pr->sd.pcm;
+    *out_samples = pr->sd.n_samples;
+    pr->sd.pcm = NULL;
+    sd_free(&pr->sd);
+    return pcm;
+}
+
 /* 请求收尾: 丢弃扣住的尾部静音 (对应文件输出的尾部裁剪) */
 static void player_drop_hold(Player* p)
 {
@@ -1674,18 +1773,12 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     OrtValue* t_pvl    = MK_I32(pvl_buf, sh_pvl, 1);
 
     int32_t past_len = (int32_t)S;
-    int silent_batches = 0;
 
     int16_t* out = (int16_t*)xmalloc(sizeof(int16_t) * (size_t)max_frames * N_VQ);
     size_t n_frames = 0;
 
-    StreamDec sd;
-    sd_init(&sd);
-    if (pl) {
-        sd.cb = player_on_audio;
-        sd.cb_ctx = pl;
-        player_begin(pl);
-    }
+    Probe probe;
+    probe_start(&probe, m, pl);
 
     /* 待解码的帧: 攒够 SD_BATCH 帧一起解码 (太小调度开销大, 太大峰值内存高) */
     enum { SD_BATCH = MOSS_SD_BATCH };
@@ -1739,19 +1832,15 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
         n_frames++;
         n_pend++;
 
-        /* 攒够一批就解码; 顺便用解码出来的能量判断是不是已经说完 */
+        /* 攒够一批就丢给工作线程解码; 连续静音判据由它发布 (最多滞后一批) */
         if (n_pend == SD_BATCH) {
             uint64_t _tp = now_ms();
-            sd_run(m, &sd, pend, (size_t)n_pend);
+            probe_submit(&probe, pend, n_pend);
             g_stats.probe += now_ms() - _tp;
             n_pend = 0;
-            if (sd.last_energy < 1.0e-5) {
-                if (++silent_batches >= 2) {
-                    if (verbose) fprintf(stderr, "  [step %d] trailing silence, stop\n", step);
-                    break;
-                }
-            } else {
-                silent_batches = 0;
+            if (probe.published >= 2) {
+                if (verbose) fprintf(stderr, "  [step %d] trailing silence, stop\n", step);
+                break;
             }
         }
 
@@ -1785,13 +1874,15 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
             fprintf(stderr, "  frame %d/%d (seq %d)\n", step + 1, max_frames, past_len);
     }
 
-    /* 把最后不足一批的帧也解码掉 */
+    /* 剩余不足一批的帧提交掉, 等工作线程收尾并交还音频 */
     if (n_pend > 0) {
         uint64_t _tp = now_ms();
-        sd_run(m, &sd, pend, (size_t)n_pend);
+        probe_submit(&probe, pend, n_pend);
         g_stats.probe += now_ms() - _tp;
         n_pend = 0;
     }
+    size_t sd_n = 0;
+    float* sd_pcm = probe_finish(&probe, &sd_n);
     if (pl) player_drop_hold(pl);
 
     if (dump_frames && dump_frames[0]) {
@@ -1812,10 +1903,8 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     free(step_ids); free(pvl_buf);
     free(out);
 
-    *out_pcm = sd.pcm;
-    *out_samples = sd.n_samples;
-    sd.pcm = NULL;
-    sd_free(&sd);
+    *out_pcm = sd_pcm;
+    *out_samples = sd_n;
     return n_frames;
 }
 /* codec 编码: 参考音频 -> codes */
@@ -2434,6 +2523,43 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
 }
 
 /* ---------------------------------------------------------------------------
+ * 8.6 P 核自动钉核
+ *
+ * Intel 12 代起的混合架构: P 核带超线程 (1 物理 2 逻辑), E 核没有 (1:1)。
+ * 把进程钉在所有"带 SMT 的核"上, ORT 工作线程就不会漂到能效核 ---- 实测
+ * 每帧 30+30ms -> 26+26ms (~15%)。非混合 CPU 检测结果是全量掩码, 等于不钉。
+ * -------------------------------------------------------------------------*/
+static DWORD_PTR auto_p_core_mask(void)
+{
+    DWORD len = 0;
+    /* 第一次调用预期失败 (ERROR_INSUFFICIENT_BUFFER), 只要 len 填上了就继续 */
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    if (!len) return 0;
+    BYTE* buf = (BYTE*)xmalloc(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                          (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len)) {
+        free(buf);
+        return 0;
+    }
+    DWORD_PTR smt = 0, all = 0;
+    BYTE* p = buf;
+    while (p < buf + len) {
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* e = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)p;
+        if (e->Relationship == RelationProcessorCore) {
+            DWORD_PTR m = e->Processor.GroupMask[0].Mask;   /* 单处理器组假设 (<64 LP) */
+            all |= m;
+            int bits = 0;
+            for (DWORD_PTR t = m; t; t >>= 1) bits += (int)(t & 1);
+            if (bits >= 2) smt |= m;                        /* 带超线程的核 = P 核 */
+        }
+        if (e->Size == 0) break;
+        p += e->Size;
+    }
+    free(buf);
+    return smt ? smt : all;
+}
+
+/* ---------------------------------------------------------------------------
  * 9. main
  * -------------------------------------------------------------------------*/
 /* 崩溃时打印出错模块, 方便定位 (ONNX Runtime 内部崩溃时很有用) */
@@ -2468,6 +2594,7 @@ static void usage(void)
         "  --seed <n>          随机种子 (默认 1234)\n"
         "  --max-frames <n>    单块最大帧数 (默认 375, 12.5 帧/秒)\n"
         "  --threads <n>       ONNX 线程数 (默认 4, 实测再多反而更慢)\n"
+        "  --affinity <hex>    进程钉核掩码 (默认自动: 混合架构只钉 P 核, 如 ff)\n"
         "  --tokens            只打印分词结果\n"
         "  --verbose           打印生成过程\n"
         "  --no-eos            关闭 token 重复检测 (只依赖能量判据)\n"
@@ -2495,6 +2622,7 @@ int wmain(int argc, wchar_t** argv)
     const wchar_t* voice_w = L"神里绫华";   /* 默认音色: 用户克隆的音色 */
     wchar_t dump_frames[MAX_PATH] = L"";
     int threads = 0;
+    unsigned long affinity = 0;
 
     /* 文本: 拼接所有非选项参数 */
     {
@@ -2516,6 +2644,7 @@ int wmain(int argc, wchar_t** argv)
                 else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
                 else if (!wcscmp(a, L"--max-frames") && i + 1 < argc) { max_frames = _wtoi(argv[++i]); }
                 else if (!wcscmp(a, L"--threads") && i + 1 < argc) { threads = _wtoi(argv[++i]); }
+                else if (!wcscmp(a, L"--affinity") && i + 1 < argc) { affinity = wcstoul(argv[++i], NULL, 16); }
                 else if (!wcscmp(a, L"--tokens")) { tokens_only = 1; }
                 else if (!wcscmp(a, L"--verbose")) { verbose = 1; }
                 else if (!wcscmp(a, L"--no-eos")) { no_eos = 1; }
@@ -2558,6 +2687,16 @@ int wmain(int argc, wchar_t** argv)
         threads = (int)si.dwNumberOfProcessors;
         if (threads <= 0) threads = 4;
         if (threads > 4) threads = 4;
+    }
+
+    /* 钉核: 显式 --affinity 优先; 否则混合架构自动钉 P 核 (带 SMT 的核) */
+    {
+        DWORD_PTR m = affinity ? (DWORD_PTR)affinity : auto_p_core_mask();
+        if (m && SetProcessAffinityMask(GetCurrentProcess(), m))
+            printf("affinity  : 0x%llX%s\n", (unsigned long long)m,
+                   affinity ? "" : " (自动, 带 SMT 的核)");
+        else if (affinity)
+            fprintf(stderr, "[warn] SetProcessAffinityMask(0x%lX) 失败 (%lu)\n", affinity, GetLastError());
     }
 
     /* ---- 分词器 ---- */
