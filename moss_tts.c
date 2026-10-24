@@ -1280,8 +1280,8 @@ typedef struct {
     size_t    n_samples;               /* 每声道采样点数 */
     size_t    cap;
     double    last_energy;             /* 最近一批的均方能量 */
-    /* 每批音频解码完成后的回调 (流式播放挂在这里), silent = 该批为静音 */
-    void    (*cb)(void* ctx, const float* interleaved, size_t n, int silent);
+    /* 每批音频解码完成后的回调 (流式播放挂在这里), energy 传给回调自己判 */
+    void    (*cb)(void* ctx, const float* interleaved, size_t n, double energy);
     void*     cb_ctx;
 } StreamDec;
 
@@ -1390,7 +1390,7 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
     }
     sd->last_energy = acc / (double)(tail * CHANNELS);
     sd_append(sd, inter, per);
-    if (sd->cb) sd->cb(sd->cb_ctx, inter, per, sd->last_energy < 1.0e-5);
+    if (sd->cb) sd->cb(sd->cb_ctx, inter, per, sd->last_energy);
     free(inter);
 
     /* 状态交替换入: 输出直接作为下一次的输入 */
@@ -1419,13 +1419,19 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
 /* ---------------------------------------------------------------------------
  * 流式播放 (waveOut)
  *
- * 合成比实时快 (RTF<1), 边生成边把每批音频 (约 1.28s) 推给声卡; 8 块环形
- * 缓冲约 4 秒, 播放进度反过来给生成背压。静音批次先扣住 (hold) 不播:
- * 后续有声批次到来时按原顺序补播 —— 句中停顿照常保留, 而结尾那段模型吐出
- * 的多余静音在请求结束时整体丢弃, 与文件输出的尾部裁剪行为一致。
+ * 合成比实时快 (RTF<1), 边生成边把每批音频推给声卡; 8 块环形缓冲约 4 秒,
+ * 播放进度反过来给生成背压。两个保护:
+ *   - 开播预缓冲: 请求开始先攒 ~1s 音频再出声。直接首播的话队列没有余量,
+ *     OS 调度抖一下/chunk 交界的 prefill 断流就会欠载, 听感是开头吃字、
+ *     说半句断一下, 攒一会儿又恢复
+ *   - 静音扣留 (hold): 静音批次先扣住, 后续有声批次按原顺序补播 (句中停顿
+ *     照常保留), 请求结束整体丢弃。静音阈值取文件路径尾部裁剪同一档
+ *     (RMS 0.01), 模型结尾吐的低幅噪声/稀疏脉冲就不会被播出去
  * -------------------------------------------------------------------------*/
 #define PL_NBUF     8
 #define PL_BUF_SMPL (SAMPLE_RATE / 2)     /* 每块 0.5s */
+#define PL_PRE_SMPL (SAMPLE_RATE)         /* 开播前先攒 1s */
+#define PL_SILENT_E 1.0e-4                /* 静音判据 (与文件尾部裁剪一致) */
 
 typedef struct {
     HWAVEOUT ho;
@@ -1434,14 +1440,20 @@ typedef struct {
     int      used[PL_NBUF];
     float*   hold;                        /* 扣住的静音批次 */
     size_t   hold_n, hold_cap;
+    float*   pre;                         /* 开播前的预缓冲 */
+    size_t   pre_n, pre_cap;
+    int      prebuffering;
     int      live;
     uint64_t t_start, t_first;            /* 请求开始 / 首批音频出声时刻 */
     size_t   pushed;
 } Player;
 
+static void player_emit(Player* p, const float* inter, size_t n);
+
 static void player_open(Player* p, int allow_device)
 {
     memset(p, 0, sizeof(*p));
+    p->prebuffering = 1;            /* 开播前先攒 ~1s */
     if (!allow_device) return;      /* --no-play: 只走回调计时, 不碰声卡 */
     WAVEFORMATEX wf;
     wf.wFormatTag = WAVE_FORMAT_PCM;
@@ -1479,6 +1491,7 @@ static void player_close(Player* p)
     }
     waveOutClose(p->ho);
     free(p->hold);
+    free(p->pre);
     p->live = 0;
 }
 
@@ -1489,13 +1502,75 @@ static void player_begin(Player* p)
     p->hold_n = 0;
 }
 
-/* 新请求边界: 重置首字时刻统计 (t_first 在 emit 时置位, 一次请求内跨 chunk 保持) */
+/* 新请求边界: 重置首字时刻与预缓冲 (t_first 在 push 时置位, 一次请求内跨 chunk 保持) */
 static void player_request(Player* p)
 {
     p->t_first = 0;
+    p->prebuffering = 1;
+    p->pre_n = 0;
 }
 
-/* 把一段音频塞进空闲块提交给声卡; 没有空闲块就等播放消费 (背压) */
+static void pre_append(Player* p, const float* inter, size_t n)
+{
+    if (p->pre_n + n > p->pre_cap) {
+        size_t nc = p->pre_cap ? p->pre_cap : 65536;
+        while (nc < p->pre_n + n) nc *= 2;
+        float* b = (float*)realloc(p->pre, sizeof(float) * nc * CHANNELS);
+        if (!b) die("out of memory");
+        p->pre = b;
+        p->pre_cap = nc;
+    }
+    memcpy(p->pre + p->pre_n * CHANNELS, inter, sizeof(float) * n * CHANNELS);
+    p->pre_n += n;
+}
+
+static void player_push(Player* p, const float* inter, size_t n, double energy)
+{
+    if (n == 0) return;
+    int silent = energy < PL_SILENT_E;
+    if (silent) {
+        if (!p->live) return;
+        if (p->hold_n + n > p->hold_cap) {
+            size_t nc = p->hold_cap ? p->hold_cap : 65536;
+            while (nc < p->hold_n + n) nc *= 2;
+            float* b = (float*)realloc(p->hold, sizeof(float) * nc * CHANNELS);
+            if (!b) die("out of memory");
+            p->hold = b;
+            p->hold_cap = nc;
+        }
+        memcpy(p->hold + p->hold_n * CHANNELS, inter, sizeof(float) * n * CHANNELS);
+        p->hold_n += n;
+        return;
+    }
+    /* 首个有声批次就绪的时刻 = 首字延迟 (与有没有音频设备无关) */
+    if (!p->t_first) p->t_first = now_ms();
+    if (!p->live) return;
+
+    if (p->prebuffering) {
+        /* 攒够 PL_PRE_SMPL 才开播; 期间扣住的静音一并按序进缓冲 */
+        if (p->hold_n) {
+            pre_append(p, p->hold, p->hold_n);
+            p->hold_n = 0;
+        }
+        pre_append(p, inter, n);
+        if (p->pre_n >= PL_PRE_SMPL) {
+            p->prebuffering = 0;
+            player_emit(p, p->pre, p->pre_n);
+            p->pre_n = 0;
+        }
+        return;
+    }
+    if (p->hold_n) {
+        player_emit(p, p->hold, p->hold_n);
+        p->hold_n = 0;
+    }
+    player_emit(p, inter, n);
+}
+
+static void player_on_audio(void* ctx, const float* inter, size_t n, double energy)
+{
+    player_push((Player*)ctx, inter, n, energy);
+}
 static void player_emit(Player* p, const float* inter, size_t n)
 {
     size_t off = 0;
@@ -1527,38 +1602,6 @@ static void player_emit(Player* p, const float* inter, size_t n)
         off += take;
     }
     p->pushed += n;
-}
-
-static void player_push(Player* p, const float* inter, size_t n, int silent)
-{
-    if (n == 0) return;
-    if (silent) {
-        if (!p->live) return;
-        if (p->hold_n + n > p->hold_cap) {
-            size_t nc = p->hold_cap ? p->hold_cap : 65536;
-            while (nc < p->hold_n + n) nc *= 2;
-            float* b = (float*)realloc(p->hold, sizeof(float) * nc * CHANNELS);
-            if (!b) die("out of memory");
-            p->hold = b;
-            p->hold_cap = nc;
-        }
-        memcpy(p->hold + p->hold_n * CHANNELS, inter, sizeof(float) * n * CHANNELS);
-        p->hold_n += n;
-        return;
-    }
-    /* 首个有声批次就绪的时刻 = 首字延迟 (与有没有音频设备无关) */
-    if (!p->t_first) p->t_first = now_ms();
-    if (!p->live) return;
-    if (p->hold_n) {
-        player_emit(p, p->hold, p->hold_n);
-        p->hold_n = 0;
-    }
-    player_emit(p, inter, n);
-}
-
-static void player_on_audio(void* ctx, const float* inter, size_t n, int silent)
-{
-    player_push((Player*)ctx, inter, n, silent);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1784,6 +1827,7 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     enum { SD_BATCH = MOSS_SD_BATCH };
     int16_t pend[SD_BATCH * N_VQ];
     int n_pend = 0;
+    int batch_goal = 4;             /* 前几批小批量: 4 -> 8 -> 16 */
 
     for (int step = 0; step < max_frames; step++) {
         u_asst[0] = rng_u(&rng);
@@ -1833,11 +1877,12 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
         n_pend++;
 
         /* 攒够一批就丢给工作线程解码; 连续静音判据由它发布 (最多滞后一批) */
-        if (n_pend == SD_BATCH) {
+        if (n_pend >= batch_goal) {
             uint64_t _tp = now_ms();
             probe_submit(&probe, pend, n_pend);
             g_stats.probe += now_ms() - _tp;
             n_pend = 0;
+            batch_goal = batch_goal == 4 ? 8 : SD_BATCH;
             if (probe.published >= 2) {
                 if (verbose) fprintf(stderr, "  [step %d] trailing silence, stop\n", step);
                 break;
