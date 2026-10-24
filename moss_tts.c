@@ -322,7 +322,11 @@ static void sess_open_ex(Session* S, const wchar_t* dir, const wchar_t* file, in
     OK(ort->AddSessionConfigEntry(so, "session.intra_op.allow_spinning", "0"));
     if (no_arena & 1) OK(ort->DisableCpuMemArena(so));
     if (no_arena & 2) OK(ort->DisableMemPattern(so));
-    OK(ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
+    /* BASIC 而非 ALL: 实测这个规模的图, ALL 级别的额外优化 (布局变换等)
+     * 对每步小矩阵是负收益 —— 每帧 52.3 -> 46.5ms (-11%), decode步 -16%。
+     * 加载时长与级别无关 (瓶颈在 .data 读取, 试过 .ort 缓存更慢已弃)。
+     * 输出与 ALL 逐字节同长, 最大 1 LSB 舍入差, 数值等价。 */
+    OK(ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_BASIC));
     OrtStatus* st = ort->CreateSession(g_env, path, so, &S->s);
     ort->ReleaseSessionOptions(so);
     if (st) {
@@ -1444,8 +1448,7 @@ typedef struct {
     size_t   pre_n, pre_cap;
     int      prebuffering;
     int      live;
-    uint64_t t_start, t_first;            /* 请求开始 / 首批音频出声时刻 */
-    size_t   pushed;
+    uint64_t t_first;                     /* 首批音频出声时刻 */
     size_t   emitted;                     /* 本请求实际推给声卡的采样数 */
 } Player;
 
@@ -1498,8 +1501,6 @@ static void player_close(Player* p)
 
 static void player_begin(Player* p)
 {
-    p->t_start = now_ms();
-    p->pushed = 0;
     p->hold_n = 0;
 }
 
@@ -1603,7 +1604,6 @@ static void player_emit(Player* p, const float* inter, size_t n)
         p->used[i] = 1;
         off += take;
     }
-    p->pushed += n;
     p->emitted += n;
 }
 
@@ -3007,11 +3007,15 @@ int wmain(int argc, wchar_t** argv)
                 }
                 double as = (double)tot / SAMPLE_RATE;
                 double gs = (double)(now_ms() - rq) / 1000.0;
-                printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f%s%.2f s\n",
-                       (unsigned long long)(player.t_first ? player.t_first - rq : 0),
-                       as, gs, as > 0.0 ? gs / as : 0.0,
-                       player.live ? " | 播放 " : "",
-                       player.live ? (double)player.emitted / SAMPLE_RATE : 0.0);
+                if (player.live)
+                    printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f | 播放 %.2f s\n",
+                           (unsigned long long)(player.t_first ? player.t_first - rq : 0),
+                           as, gs, as > 0.0 ? gs / as : 0.0,
+                           (double)player.emitted / SAMPLE_RATE);
+                else
+                    printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f\n",
+                           (unsigned long long)(player.t_first ? player.t_first - rq : 0),
+                           as, gs, as > 0.0 ? gs / as : 0.0);
                 free(audio);
             } else {
                 fprintf(stderr, "  [warn] 没有生成音频\n");
