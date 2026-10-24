@@ -1305,9 +1305,12 @@ typedef struct {
     size_t    n_samples;               /* 每声道采样点数 */
     size_t    cap;
     double    last_energy;             /* 最近一批的均方能量 */
-    /* 每批音频解码完成后的回调 (流式播放挂在这里), energy 传给回调自己判 */
-    void    (*cb)(void* ctx, const float* interleaved, size_t n, double energy);
+    /* 每批音频解码完成后的回调 (流式播放挂在这里), energy 传给回调自己判;
+     * final=1 表示这是收尾批 (probe_finish 已置 stop), 播放侧扣住它做
+     * 窗口级尾部裁剪, 其余批次立即播放 */
+    void    (*cb)(void* ctx, const float* interleaved, size_t n, double energy, int final);
     void*     cb_ctx;
+    int       hold_final;
 } StreamDec;
 
 static void sd_free(StreamDec* sd)
@@ -1415,7 +1418,7 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
     }
     sd->last_energy = acc / (double)(tail * CHANNELS);
     sd_append(sd, inter, per);
-    if (sd->cb) sd->cb(sd->cb_ctx, inter, per, sd->last_energy);
+    if (sd->cb) sd->cb(sd->cb_ctx, inter, per, sd->last_energy, sd->hold_final);
     free(inter);
 
     /* 状态交替换入: 输出直接作为下一次的输入 */
@@ -1564,7 +1567,7 @@ static void pre_append(Player* p, const float* inter, size_t n)
     p->pre_n += n;
 }
 
-static void player_push(Player* p, const float* inter, size_t n, double energy)
+static void player_push(Player* p, const float* inter, size_t n, double energy, int final)
 {
     if (n == 0) return;
     int silent = energy < PL_SILENT_E;
@@ -1586,10 +1589,16 @@ static void player_push(Player* p, const float* inter, size_t n, double energy)
     if (!p->t_first) p->t_first = now_ms();
     if (!p->live) return;
 
+    /* 收尾批: 扣在 pre 里, drop_hold 时按文件同款规则裁剪后放行。
+     * 只有确知是最后一批才扣 -- 平时永久滞后一批的话, 机器忙、播放队列
+     * 贴地时会出现 "说完又蹦出一段" (扣住的尾字脱节) 和节奏性断流 */
+    if (final) {
+        pre_append(p, inter, n);
+        return;
+    }
+
     if (p->prebuffering) {
-        /* 攒够 PL_PRE_SMPL 才开播; 期间扣住的静音一并按序进缓冲。
-         * 开播时最新一批照旧扣住 (见下), 出声时刻不变, 只是设备队列
-         * 里永远滞后一批 */
+        /* 攒够 PL_PRE_SMPL 才开播; 期间扣住的静音一并按序进缓冲 */
         if (p->hold_n) {
             pre_append(p, p->hold, p->hold_n);
             p->hold_n = 0;
@@ -1597,32 +1606,21 @@ static void player_push(Player* p, const float* inter, size_t n, double energy)
         pre_append(p, inter, n);
         if (p->pre_n >= PL_PRE_SMPL) {
             p->prebuffering = 0;
-            size_t keep = n;                     /* 扣住最新一批 */
-            size_t emit_n = p->pre_n > keep ? p->pre_n - keep : 0;
-            if (emit_n) player_emit(p, p->pre, emit_n);
-            if (emit_n) memmove(p->pre, p->pre + emit_n * CHANNELS,
-                                sizeof(float) * (p->pre_n - emit_n) * CHANNELS);
-            p->pre_n -= emit_n;
+            player_emit(p, p->pre, p->pre_n);
+            p->pre_n = 0;
         }
         return;
-    }
-    /* 流式: 最新一批扣在 pre 里; 下一批到来时放行上一批。收尾
-     * (player_drop_hold) 才对扣住的这批做窗口级尾部裁剪, 与文件
-     * 输出行为一致 -- 否则结尾那批"半个音节+杂音"会整批播出去 */
-    if (p->pre_n) {
-        player_emit(p, p->pre, p->pre_n);
-        p->pre_n = 0;
     }
     if (p->hold_n) {
         player_emit(p, p->hold, p->hold_n);
         p->hold_n = 0;
     }
-    pre_append(p, inter, n);
+    player_emit(p, inter, n);
 }
 
-static void player_on_audio(void* ctx, const float* inter, size_t n, double energy)
+static void player_on_audio(void* ctx, const float* inter, size_t n, double energy, int final)
 {
-    player_push((Player*)ctx, inter, n, energy);
+    player_push((Player*)ctx, inter, n, energy, final);
 }
 static void player_emit(Player* p, const float* inter, size_t n)
 {
@@ -1691,7 +1689,9 @@ static DWORD WINAPI probe_worker(LPVOID p)
             n = pr->job_n;
             pr->queued = 0;
         }
-        stop = pr->stop && !pr->queued;
+        /* stop 已置且没有后续作业 -> 这是收尾批, 交给播放侧扣留裁剪 */
+        pr->sd.hold_final = pr->stop && !pr->queued;
+        stop = pr->sd.hold_final;
         LeaveCriticalSection(&pr->cs);
         if (n > 0) {
             uint64_t t = now_ms();
