@@ -1305,12 +1305,9 @@ typedef struct {
     size_t    n_samples;               /* 每声道采样点数 */
     size_t    cap;
     double    last_energy;             /* 最近一批的均方能量 */
-    /* 每批音频解码完成后的回调 (流式播放挂在这里), energy 传给回调自己判;
-     * final=1 表示这是收尾批 (probe_finish 已置 stop), 播放侧扣住它做
-     * 窗口级尾部裁剪, 其余批次立即播放 */
-    void    (*cb)(void* ctx, const float* interleaved, size_t n, double energy, int final);
+    /* 每批音频解码完成后的回调 (流式播放挂在这里), energy 传给回调自己判 */
+    void    (*cb)(void* ctx, const float* interleaved, size_t n, double energy);
     void*     cb_ctx;
-    int       hold_final;
 } StreamDec;
 
 static void sd_free(StreamDec* sd)
@@ -1418,7 +1415,7 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
     }
     sd->last_energy = acc / (double)(tail * CHANNELS);
     sd_append(sd, inter, per);
-    if (sd->cb) sd->cb(sd->cb_ctx, inter, per, sd->last_energy, sd->hold_final);
+    if (sd->cb) sd->cb(sd->cb_ctx, inter, per, sd->last_energy);
     free(inter);
 
     /* 状态交替换入: 输出直接作为下一次的输入 */
@@ -1458,7 +1455,7 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
  * -------------------------------------------------------------------------*/
 #define PL_NBUF     8
 #define PL_BUF_SMPL (SAMPLE_RATE / 2)     /* 每块 0.5s */
-#define PL_PRE_SMPL (SAMPLE_RATE)         /* 开播前先攒 1s */
+#define PL_PRE_SMPL (SAMPLE_RATE * 3 / 5) /* 开播前先攒 0.6s */
 #define PL_SILENT_E 1.0e-4                /* 静音判据 (与文件尾部裁剪一致) */
 
 typedef struct {
@@ -1474,6 +1471,8 @@ typedef struct {
     int      live;
     uint64_t t_first;                     /* 首批音频出声时刻 */
     size_t   emitted;                     /* 本请求实际推给声卡的采样数 */
+    size_t   last_bs[2];                  /* 最近两批的采样数 (自适应扣留) */
+    int      nbs;
 } Player;
 
 static void player_emit(Player* p, const float* inter, size_t n);
@@ -1535,6 +1534,8 @@ static void player_request(Player* p)
     p->prebuffering = 1;
     p->pre_n = 0;
     p->emitted = 0;
+    p->nbs = 0;
+    p->last_bs[0] = p->last_bs[1] = 0;
 }
 
 /* 与文件输出同一套尾部裁剪: 最后一个 20ms 窗 RMS>1e-4 之后保留 0.2s */
@@ -1567,7 +1568,18 @@ static void pre_append(Player* p, const float* inter, size_t n)
     p->pre_n += n;
 }
 
-static void player_push(Player* p, const float* inter, size_t n, double energy, int final)
+/* 声卡里还排着多少音频 (采样数) */
+static size_t player_queue_depth(Player* p)
+{
+    if (!p->live) return 0;
+    MMTIME mm;
+    memset(&mm, 0, sizeof(mm));
+    mm.wType = TIME_SAMPLES;
+    if (waveOutGetPosition(p->ho, &mm, sizeof(mm)) != MMSYSERR_NOERROR) return 0;
+    return p->emitted > (size_t)mm.u.sample ? p->emitted - (size_t)mm.u.sample : 0;
+}
+
+static void player_push(Player* p, const float* inter, size_t n, double energy)
 {
     if (n == 0) return;
     int silent = energy < PL_SILENT_E;
@@ -1589,14 +1601,6 @@ static void player_push(Player* p, const float* inter, size_t n, double energy, 
     if (!p->t_first) p->t_first = now_ms();
     if (!p->live) return;
 
-    /* 收尾批: 扣在 pre 里, drop_hold 时按文件同款规则裁剪后放行。
-     * 只有确知是最后一批才扣 -- 平时永久滞后一批的话, 机器忙、播放队列
-     * 贴地时会出现 "说完又蹦出一段" (扣住的尾字脱节) 和节奏性断流 */
-    if (final) {
-        pre_append(p, inter, n);
-        return;
-    }
-
     if (p->prebuffering) {
         /* 攒够 PL_PRE_SMPL 才开播; 期间扣住的静音一并按序进缓冲 */
         if (p->hold_n) {
@@ -1611,16 +1615,37 @@ static void player_push(Player* p, const float* inter, size_t n, double energy, 
         }
         return;
     }
+
+    /* 队列深度自适应扣留: 队列深 (生成远快于播放) -> 扣住最近两批,
+     * 收尾时对最多 2.5s 的尾巴做窗口级裁剪, 拦住跨两批的结尾垃圾;
+     * 队列浅 (机器忙) -> 立即放行, 宁可少裁也不制造断流/脱节。 */
     if (p->hold_n) {
         player_emit(p, p->hold, p->hold_n);
         p->hold_n = 0;
     }
-    player_emit(p, inter, n);
+    pre_append(p, inter, n);
+    p->last_bs[1] = p->last_bs[0];
+    p->last_bs[0] = n;
+    if (p->nbs < 2) p->nbs++;
+
+    size_t depth = player_queue_depth(p);
+    int keep = depth >= (size_t)(SAMPLE_RATE * 3 / 2) ? 2
+             : depth >= (size_t)(SAMPLE_RATE * 4 / 5) ? 1 : 0;
+    if (keep > p->nbs) keep = p->nbs;
+    size_t keep_smpl = 0;
+    for (int k = 0; k < keep; k++) keep_smpl += p->last_bs[k];
+    if (p->pre_n > keep_smpl) {
+        size_t emit_n = p->pre_n - keep_smpl;
+        player_emit(p, p->pre, emit_n);
+        memmove(p->pre, p->pre + emit_n * CHANNELS,
+                sizeof(float) * keep_smpl * CHANNELS);
+        p->pre_n = keep_smpl;
+    }
 }
 
-static void player_on_audio(void* ctx, const float* inter, size_t n, double energy, int final)
+static void player_on_audio(void* ctx, const float* inter, size_t n, double energy)
 {
-    player_push((Player*)ctx, inter, n, energy, final);
+    player_push((Player*)ctx, inter, n, energy);
 }
 static void player_emit(Player* p, const float* inter, size_t n)
 {
@@ -1689,9 +1714,7 @@ static DWORD WINAPI probe_worker(LPVOID p)
             n = pr->job_n;
             pr->queued = 0;
         }
-        /* stop 已置且没有后续作业 -> 这是收尾批, 交给播放侧扣留裁剪 */
-        pr->sd.hold_final = pr->stop && !pr->queued;
-        stop = pr->sd.hold_final;
+        stop = pr->stop && !pr->queued;
         LeaveCriticalSection(&pr->cs);
         if (n > 0) {
             uint64_t t = now_ms();
@@ -1771,14 +1794,15 @@ static void player_play_all(Player* p, const float* pcm, size_t n)
 static void player_drop_hold(Player* p)
 {
     p->hold_n = 0;
-    /* 扣住的尾批按文件同款规则裁剪 (20ms 窗) 后放行; 没攒满预缓冲的
-     * 短句 (如 "你是谁" 0.8s) 也走同一裁剪, 不冲就永远不播 */
+    /* 扣住的尾批 (自适应最多 2 批) 按文件同款规则裁剪 (20ms 窗) 后放行;
+     * 没攒满预缓冲的短句也走同一裁剪 */
     if (p->pre_n > 0) {
         p->prebuffering = 0;
         size_t keep = player_trim_tail(p->pre, p->pre_n);
         if (keep && p->live) player_emit(p, p->pre, keep);
         p->pre_n = 0;
     }
+    p->nbs = 0;
 }
 
 /* 生成语音: 帧生成与 codec 解码交错进行, 音频直接累积到 out_pcm
@@ -2630,7 +2654,10 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
         size_t frames = 0;
         for (int attempt = 0; ; attempt++) {
             if (attempt > 0) gen_prefill(m, tok[ci], (size_t)nt, ref, ref_frames, 0, &st);
-            double cap = (double)nt * 5.5 + 50.0;
+            /* 验证矩阵实测: 合法短句 ~2.5 帧/token (你是谁 10~30 帧,
+             * 1加1等于几 21 帧), 跑偏形态 60 帧仍带 2.8s 句中静音;
+             * 4 帧/token + 20 帧余量能拦住跑偏而不误伤慢读 */
+            double cap = (double)nt * 4.0 + 20.0;
             /* 前两次尝试把帧数上限压到预期附近: 跑偏的早停早换, 别等它
              * 完整吐完 147 帧才发现; 最后一次兜底放开全长 */
             int mf = (guarded && attempt < 2) ? (int)(cap * 1.2) : max_frames;
