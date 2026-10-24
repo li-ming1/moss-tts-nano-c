@@ -1352,15 +1352,19 @@ static void sd_run(Models* m, StreamDec* sd, const int16_t* codes, size_t n)
     if (per == 0 || cnt < per * CHANNELS) die("stream decode returned no audio");
 
     float* inter = (float*)xmalloc(sizeof(float) * per * CHANNELS);
+    /* 只用尾部 8 帧 (0.64s) 的能量判断: 整批平均会被批次中间的短促音拉高,
+     * 导致"已经说完、后面只是零星杂音"时迟迟停不下来。 */
+    size_t tail = 8 * DOWNSAMPLE;
+    if (tail > per) tail = per;
     double acc = 0.0;
     for (size_t t = 0; t < per; t++) {
         for (int c = 0; c < CHANNELS; c++) {
             float v = au[c * per + t];
             inter[t * CHANNELS + c] = v;
-            acc += (double)v * (double)v;
+            if (t + tail >= per) acc += (double)v * (double)v;
         }
     }
-    sd->last_energy = acc / (double)(per * CHANNELS);
+    sd->last_energy = acc / (double)(tail * CHANNELS);
     sd_append(sd, inter, per);
     free(inter);
 
@@ -1969,14 +1973,16 @@ int wmain(int argc, wchar_t** argv)
 
     if (!all || total_samples == 0) die("nothing generated");
 
-    /* 模型停止生成时会带上一段尾部静音 (EOS 检测需要 step>30 才触发),
-     * 这里把末尾超过 0.2s 的静音裁掉, 听感更自然。 */
+    /* 模型说完之后还会继续吐一段静音 (偶尔夹杂稀疏的脉冲), 把末尾多余的部分裁掉。
+     * 用 20ms 窗口的 RMS 判断而不是单点幅值, 免得被孤立脉冲带偏。 */
     {
+        const size_t win = SAMPLE_RATE / 50;          /* 20ms */
         size_t last = 0;
-        for (size_t i = total_samples; i > 0; i--) {
-            float l = all[(i - 1) * CHANNELS];
-            float r = all[(i - 1) * CHANNELS + 1];
-            if (l > 0.004f || l < -0.004f || r > 0.004f || r < -0.004f) { last = i; break; }
+        for (size_t w = total_samples; w >= win; w -= win) {
+            double acc = 0.0;
+            for (size_t i = (w - win) * CHANNELS; i < w * CHANNELS; i++)
+                acc += (double)all[i] * (double)all[i];
+            if (acc / (double)(win * CHANNELS) > 1.0e-4) { last = w; break; }   /* RMS > 0.01 */
         }
         if (last > 0) {
             size_t keep = last + (size_t)(SAMPLE_RATE * 0.2);
