@@ -46,6 +46,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1767,6 +1768,186 @@ static int split_chunks(const SP* sp, const char* text, char*** out, int max_tok
     return nch;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * 8. 内置音色表 (从 browser_poc_manifest.json 读取)
+ *
+ * manifest 的 builtin_voices 里有 18 个预置音色, 每个带一段参考音频的 RVQ 码。
+ * 为了不把两万多个数字塞进源码, 这里用一个极简的 JSON 扫描器在运行时读取;
+ * 文件缺失时退回内嵌的 Junhao。
+ * -------------------------------------------------------------------------*/
+static const char* js_skip_ws(const char* p, const char* end)
+{
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    return p;
+}
+
+/* p 指向双引号, 读出字符串, 返回右引号之后的位置; 失败返回 NULL */
+static const char* js_read_str(const char* p, const char* end, char* out, int cap)
+{
+    if (p >= end || *p != '"') return NULL;
+    p++;
+    int n = 0;
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) p++;
+        if (n + 1 < cap) out[n++] = *p;
+        p++;
+    }
+    if (p >= end) return NULL;
+    out[n] = 0;
+    return p + 1;
+}
+
+/* 从 p 往后找 key 为 want 的字符串值; 返回该值之后的位置, 值写入 out */
+static const char* js_find_str(const char* p, const char* end, const char* want, char* out, int cap)
+{
+    char key[64];
+    while (p < end) {
+        if (*p != '"') { p++; continue; }
+        const char* q = js_read_str(p, end, key, sizeof(key));
+        if (!q) return NULL;
+        if (!strcmp(key, want)) {
+            q = js_skip_ws(q, end);
+            if (q < end && *q == ':') {
+                q = js_skip_ws(q + 1, end);
+                return js_read_str(q, end, out, cap);
+            }
+        }
+        p = q;
+    }
+    return NULL;
+}
+
+/* 从 p 往后找 key 为 want 的整数数组, 把其中所有整数收集起来 */
+static int16_t* js_find_int_array(const char* p, const char* end, const char* want, size_t* out_n)
+{
+    char key[64];
+    for (;;) {
+        if (p >= end) return NULL;
+        if (*p != '"') { p++; continue; }
+        const char* q = js_read_str(p, end, key, sizeof(key));
+        if (!q) return NULL;
+        if (!strcmp(key, want)) { p = q; break; }
+        p = q;
+    }
+    p = js_skip_ws(p, end);
+    if (p >= end || *p != ':') return NULL;
+    p = js_skip_ws(p + 1, end);
+    if (p >= end || *p != '[') return NULL;
+
+    size_t cap = 4096, n = 0;
+    int16_t* v = (int16_t*)xmalloc(sizeof(int16_t) * cap);
+    int depth = 0;
+    while (p < end) {
+        char c = *p;
+        if (c == '[') { depth++; p++; continue; }
+        if (c == ']') { depth--; p++; if (depth == 0) break; continue; }
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            char* e2 = NULL;
+            long x = strtol(p, &e2, 10);
+            if (e2 == p) { p++; continue; }
+            p = e2;
+            if (n == cap) {
+                cap *= 2;
+                int16_t* nv = (int16_t*)realloc(v, sizeof(int16_t) * cap);
+                if (!nv) die("out of memory");
+                v = nv;
+            }
+            v[n++] = (int16_t)x;
+            continue;
+        }
+        p++;
+    }
+    *out_n = n;
+    return v;
+}
+
+/* 取指定音色的参考码; 找不到返回 NULL */
+static int16_t* manifest_voice(const wchar_t* path, const char* name, size_t* out_frames)
+{
+    size_t len = 0;
+    char* b = (char*)read_whole_file(path, &len);
+    if (!b) return NULL;
+    const char* end = b + len;
+    const char* p = b;
+    char nm[64];
+    while ((p = js_find_str(p, end, "voice", nm, sizeof(nm))) != NULL) {
+        if (!strcmp(nm, name)) {
+            size_t n = 0;
+            int16_t* codes = js_find_int_array(p, end, "prompt_audio_codes", &n);
+            free(b);
+            if (codes && n >= N_VQ && (n % N_VQ) == 0) {
+                *out_frames = n / N_VQ;
+                return codes;
+            }
+            free(codes);
+            return NULL;
+        }
+    }
+    free(b);
+    return NULL;
+}
+
+/* 列出 manifest 里的所有音色 */
+static int manifest_list_voices(const wchar_t* path)
+{
+    size_t len = 0;
+    char* b = (char*)read_whole_file(path, &len);
+    if (!b) return 0;
+    const char* end = b + len;
+    const char* p = b;
+    char nm[64], disp[96], grp[48];
+    int n = 0;
+    while ((p = js_find_str(p, end, "voice", nm, sizeof(nm))) != NULL) {
+        const char* q = js_find_str(p, end, "display_name", disp, sizeof(disp));
+        const char* r = js_find_str(p, end, "group", grp, sizeof(grp));
+        if (q && r) printf("  %-8s %-16s %s\n", nm, grp, disp);
+        else           printf("  %s\n", nm);
+        if (++n >= 64) break;
+    }
+    free(b);
+    return n;
+}
+
+/* 参考音频预处理: 裁掉首尾静音, 峰值归一化到 0.9。
+ * 用户自己录的参考音频常常前面有几秒空白、电平也偏小, 直接送进 codec 编码
+ * 会浪费 prompt 长度、还会让克隆出来的音量忽大忽小。 */
+static size_t prep_reference(float* pcm, size_t frames)
+{
+    if (frames < (size_t)(SAMPLE_RATE / 10)) return frames;
+    const size_t win = SAMPLE_RATE / 50;          /* 20ms */
+    const double th = 2.5e-5;                     /* RMS > 0.005 */
+
+    size_t first = 0, last = 0;
+    for (size_t w = 0; w + win <= frames; w += win) {
+        double acc = 0;
+        for (size_t i = w * CHANNELS; i < (w + win) * CHANNELS; i++) acc += (double)pcm[i] * pcm[i];
+        if (acc / (double)(win * CHANNELS) > th) { first = w; break; }
+    }
+    for (size_t w = frames; w >= win; w -= win) {
+        double acc = 0;
+        for (size_t i = (w - win) * CHANNELS; i < w * CHANNELS; i++) acc += (double)pcm[i] * pcm[i];
+        if (acc / (double)(win * CHANNELS) > th) { last = w; break; }
+    }
+    if (last <= first) return frames;
+
+    size_t pad = (size_t)(SAMPLE_RATE / 20);      /* 前后各留 50ms */
+    size_t a = first > pad ? first - pad : 0;
+    size_t b = last + pad < frames ? last + pad : frames;
+
+    float peak = 0.0f;
+    for (size_t i = a * CHANNELS; i < b * CHANNELS; i++) {
+        float v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+        if (v > peak) peak = v;
+    }
+    if (peak > 0.01f) {
+        float gain = 0.9f / peak;
+        for (size_t i = a * CHANNELS; i < b * CHANNELS; i++) pcm[i] *= gain;
+    }
+    if (a > 0) memmove(pcm, pcm + a * CHANNELS, sizeof(float) * (b - a) * CHANNELS);
+    return b - a;
+}
+
 /* ---------------------------------------------------------------------------
  * 9. main
  * -------------------------------------------------------------------------*/
@@ -1791,7 +1972,9 @@ static void usage(void)
         "\n"
         "  --out <file>        输出 wav (默认 out.wav)\n"
         "  --model-dir <dir>   模型目录 (默认 models)\n"
-        "  --ref-wav <file>    参考音频, 做声音克隆 (默认用内置音色 Junhao)\n"
+        "  --voice <name>      内置音色 (默认 Junhao, 见 --list-voices)\n"
+        "  --ref-wav <file>    用自己的参考音频克隆音色 (优先于 --voice)\n"
+        "  --list-voices       列出 manifest 里的全部内置音色\n"
         "  --seed <n>          随机种子 (默认 1234)\n"
         "  --max-frames <n>    单块最大帧数 (默认 375, 12.5 帧/秒)\n"
         "  --threads <n>       ONNX 线程数 (默认 4, 实测再多反而更慢)\n"
@@ -1815,7 +1998,8 @@ int wmain(int argc, wchar_t** argv)
     wchar_t ref_wav[MAX_PATH] = L"";
     uint64_t seed = 1234;
     int max_frames = MAX_FRAMES_DEF;
-    int tokens_only = 0, verbose = 0, no_eos = 0;
+    int tokens_only = 0, verbose = 0, no_eos = 0, list_voices = 0;
+    const wchar_t* voice_w = L"Junhao";
     wchar_t dump_frames[MAX_PATH] = L"";
     int threads = 0;
 
@@ -1829,6 +2013,8 @@ int wmain(int argc, wchar_t** argv)
                 if (!wcscmp(a, L"--out") && i + 1 < argc) { wcscpy(out_path, argv[++i]); }
                 else if (!wcscmp(a, L"--model-dir") && i + 1 < argc) { wcscpy(model_dir, argv[++i]); }
                 else if (!wcscmp(a, L"--ref-wav") && i + 1 < argc) { wcscpy(ref_wav, argv[++i]); }
+                else if (!wcscmp(a, L"--voice") && i + 1 < argc) { voice_w = argv[++i]; }
+                else if (!wcscmp(a, L"--list-voices")) { list_voices = 1; }
                 else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
                 else if (!wcscmp(a, L"--max-frames") && i + 1 < argc) { max_frames = _wtoi(argv[++i]); }
                 else if (!wcscmp(a, L"--threads") && i + 1 < argc) { threads = _wtoi(argv[++i]); }
@@ -1897,9 +2083,21 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
 
-    /* ---- 参考音频 ---- */
+    /* ---- 音色 / 参考音频 ---- */
+    wchar_t manifest_path[MAX_PATH * 2];
+    _snwprintf(manifest_path, MAX_PATH * 2, L"%s\\browser_poc_manifest.json", model_dir);
+
+    if (list_voices) {
+        printf("内置音色 (来自 %ls):\n", manifest_path);
+        if (!manifest_list_voices(manifest_path))
+            fprintf(stderr, "  (读不到 manifest, 只有内嵌的 Junhao 可用)\n");
+        free(norm); free(text);
+        return 0;
+    }
+
     const int16_t* ref = k_ref_codes_junhao;
     size_t ref_frames = REF_FRAMES_JUNHAO;
+    char* voice_u8 = w2u(voice_w);
 
     Models models;
     models_open(&models, model_dir, threads);
@@ -1908,14 +2106,30 @@ int wmain(int argc, wchar_t** argv)
     if (ref_wav[0]) {
         size_t nfr = 0;
         float* wav = wav_read_48k_stereo(ref_wav, &nfr);
-        if (!wav) die("cannot read --ref-wav (need 16-bit PCM or float32 wav)");
+        if (!wav) die("cannot read --ref-wav (需要 WAV: 16/24/32-bit PCM 或 float32)");
+        nfr = prep_reference(wav, nfr);
+        if (nfr < (size_t)(SAMPLE_RATE / 2)) die("--ref-wav 有效音频太短 (至少 0.5 秒)");
+        /* 参考音频越长, prompt 越长, 每帧注意力越慢。15 秒足够克隆音色了。 */
+        if (nfr > (size_t)SAMPLE_RATE * 15) {
+            nfr = (size_t)SAMPLE_RATE * 15;
+            fprintf(stderr, "  [note] 参考音频超过 15 秒, 只取前 15 秒\n");
+        }
         ref_owned = codec_encode(&models, wav, nfr, &ref_frames);
         free(wav);
         ref = ref_owned;
-        printf("ref-wav   : %zu frames\n", ref_frames);
+        printf("ref-wav   : %.2f s -> %zu 帧 (声音克隆)\n", (double)nfr / SAMPLE_RATE, ref_frames);
+    } else if (voice_u8 && strcmp(voice_u8, "Junhao") != 0) {
+        ref_owned = manifest_voice(manifest_path, voice_u8, &ref_frames);
+        if (!ref_owned) {
+            fprintf(stderr, "找不到音色 \"%s\", 用 --list-voices 看看有哪些\n", voice_u8);
+            exit(2);
+        }
+        ref = ref_owned;
+        printf("voice     : %s (%zu 帧)\n", voice_u8, ref_frames);
     } else {
-        printf("voice     : Junhao (%zu frames)\n", ref_frames);
+        printf("voice     : Junhao (%zu 帧)\n", ref_frames);
     }
+    free(voice_u8);
     printf("threads   : %d\n", threads);
     if (verbose) {
         size_t priv = 0, ws = cur_working_set(&priv);
@@ -1987,6 +2201,22 @@ int wmain(int argc, wchar_t** argv)
         if (last > 0) {
             size_t keep = last + (size_t)(SAMPLE_RATE * 0.2);
             if (keep < total_samples) total_samples = keep;
+        }
+    }
+
+    /* 峰值归一化到 0.95: 模型会复刻参考音频的电平, 不同音色输出音量能差 12dB,
+     * 归一化之后切换音色音量一致, 顺带消掉峰值超过 1.0 造成的削波。纯增益, 不改音质。 */
+    {
+        float peak = 0.0f;
+        for (size_t i = 0; i < total_samples * CHANNELS; i++) {
+            float v = all[i] < 0 ? -all[i] : all[i];
+            if (v > peak) peak = v;
+        }
+        if (peak > 0.05f) {
+            float gain = 0.95f / peak;
+            for (size_t i = 0; i < total_samples * CHANNELS; i++) all[i] *= gain;
+            if (verbose) fprintf(stderr, "  归一化: 峰值 %.2f -> 0.95 (增益 %+.1f dB)\n",
+                                 peak, 20.0 * log10((double)gain));
         }
     }
 
