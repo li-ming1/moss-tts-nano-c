@@ -1098,7 +1098,24 @@ static DWORD WINAPI load_worker(LPVOID p)
     return 0;
 }
 
-static void models_open(Models* m, const wchar_t* dir, int threads)
+/* models/ 里放了 <name>.int8.onnx 就优先加载 (--fp32 强制原始精度) */
+static const wchar_t* pick_model(const wchar_t* dir, const wchar_t* base, int force_fp32)
+{
+    if (force_fp32) return base;
+    wchar_t path[MAX_PATH * 2];
+    const wchar_t* dot = wcsrchr(base, L'.');
+    if (dot) _snwprintf(path, MAX_PATH * 2, L"%ls\\%.*ls.int8.onnx", dir, (int)(dot - base), base);
+    else     _snwprintf(path, MAX_PATH * 2, L"%ls\\%ls.int8.onnx", dir, base);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        static wchar_t name[MAX_PATH];
+        const wchar_t* slash = wcsrchr(path, L'\\');
+        wcscpy(name, slash ? slash + 1 : path);
+        return name;
+    }
+    return base;
+}
+
+static void models_open(Models* m, const wchar_t* dir, int threads, int force_fp32)
 {
     memset(m, 0, sizeof(*m));
     ort_load();
@@ -1191,7 +1208,7 @@ static void models_open(Models* m, const wchar_t* dir, int threads)
     {
         LoadJob jobs[4] = {
             { &m->prefill, dir, L"moss_tts_prefill.onnx",                    threads, &g_stats.load_prefill, 0 },
-            { &m->decode,  dir, L"moss_tts_decode_step.onnx",                threads, &g_stats.load_decode, 0 },
+            { &m->decode,  dir, pick_model(dir, L"moss_tts_decode_step.onnx", force_fp32), threads, &g_stats.load_decode, 0 },
             { &m->frame,   dir, L"moss_tts_local_fixed_sampled_frame.onnx",  threads, &g_stats.load_frame, 0 },
             { &m->dec,     dir, L"moss_audio_tokenizer_decode_step.onnx",    threads, &g_stats.load_dec, 0 },
         };
@@ -2751,6 +2768,7 @@ static void usage(void)
         "  --play              边生成边播放 (RTF<1, 流式不卡顿)\n"
         "  --server            常驻模式: 每行一段文本, 模型只加载一次 (含 --play)\n"
         "  --no-play           配合 --server: 只合成不播放\n"
+        "  --fp32              强制原始精度 (models/ 有 .int8.onnx 变体时默认用 int8)\n"
         "  --seed <n>          随机种子 (默认 1234)\n"
         "  --max-frames <n>    单块最大帧数 (默认 375, 12.5 帧/秒)\n"
         "  --threads <n>       ONNX 线程数 (默认 4, 实测再多反而更慢)\n"
@@ -2779,7 +2797,7 @@ int wmain(int argc, wchar_t** argv)
     uint64_t seed = 1234;
     int max_frames = MAX_FRAMES_DEF;
     int tokens_only = 0, verbose = 0, no_eos = 0, list_voices = 0;
-    int play = 0, server = 0, no_play = 0, out_given = 0;
+    int play = 0, server = 0, no_play = 0, out_given = 0, fp32 = 0;
     const wchar_t* voice_w = L"神里绫华";   /* 默认音色: 用户克隆的音色 */
     wchar_t dump_frames[MAX_PATH] = L"";
     int threads = 0;
@@ -2802,6 +2820,7 @@ int wmain(int argc, wchar_t** argv)
                 else if (!wcscmp(a, L"--play")) { play = 1; }
                 else if (!wcscmp(a, L"--server")) { server = 1; }
                 else if (!wcscmp(a, L"--no-play")) { no_play = 1; }
+                else if (!wcscmp(a, L"--fp32")) { fp32 = 1; }
                 else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
                 else if (!wcscmp(a, L"--max-frames") && i + 1 < argc) { max_frames = _wtoi(argv[++i]); }
                 else if (!wcscmp(a, L"--threads") && i + 1 < argc) { threads = _wtoi(argv[++i]); }
@@ -2899,7 +2918,7 @@ int wmain(int argc, wchar_t** argv)
     size_t ref_frames = REF_FRAMES_AYAKA;
 
     Models models;
-    models_open(&models, model_dir, threads);
+    models_open(&models, model_dir, threads, fp32);
 
     int16_t* ref_owned = NULL;
     if (ref_wav[0]) {
