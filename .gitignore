@@ -22,3 +22,6 @@ onnxruntime.dll
 # 本地工具状态
 .workbuddy-ai/
 .vs/
+
+# 克隆用的参考音频 (来源素材, 保留在本地不入库)
+*.mp3
