@@ -1711,12 +1711,17 @@ static void player_drop_hold(Player* p)
 
 /* 生成语音: 帧生成与 codec 解码交错进行, 音频直接累积到 out_pcm
  * 返回生成的帧数 */
-static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
-                              const int16_t* ref, size_t ref_frames,
-                              float** out_pcm, size_t* out_samples,
-                              uint64_t seed, int max_frames,
-                              int verbose, int use_eos, const wchar_t* dump_frames,
-                              Player* pl)
+/* 一个 chunk 的 prefill 结果: 帧循环的初始状态 (kv 由 gen_run 释放) */
+typedef struct {
+    OrtValue* kv[GLOBAL_LAYERS * 2];
+    float     hidden[HIDDEN];
+    int32_t   past_len;
+} GenPre;
+
+/* 拼 prompt 行并跑 prefill, 产出初始 hidden + KV */
+static void gen_prefill(Models* m, const int32_t* text_ids, size_t n_text,
+                        const int16_t* ref, size_t ref_frames,
+                        int verbose, GenPre* st)
 {
     size_t S = (size_t)12 + 1 + ref_frames + 1 + 56 + n_text + 6 + 1;
 
@@ -1769,21 +1774,30 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     g_stats.prefill += now_ms() - _t0;
 
     float* hidden_all = (float*)tensor_data(pout[0], NULL);
-    float hidden[HIDDEN];
-    memcpy(hidden, hidden_all + (S - 1) * HIDDEN, sizeof(float) * HIDDEN);
+    memcpy(st->hidden, hidden_all + (S - 1) * HIDDEN, sizeof(float) * HIDDEN);
 
     ort->ReleaseValue(pout[0]);
-    pout[0] = NULL;
 
-    OrtValue* kv[GLOBAL_LAYERS * 2];
-    for (int k = 0; k < GLOBAL_LAYERS * 2; k++) kv[k] = pout[1 + k];
+    for (int k = 0; k < GLOBAL_LAYERS * 2; k++) st->kv[k] = pout[1 + k];
+    st->past_len = (int32_t)S;
 
     ort->ReleaseValue(pin[0]);
     ort->ReleaseValue(pin[1]);
     free(ids);
     free(amask);
+}
 
-    /* ---- 自回归帧循环 (边生成边解码) ---- */
+/* 自回归帧循环 (边生成边解码): 消费并释放 st 的 KV, 返回生成的帧数 */
+static size_t gen_run(Models* m, GenPre* st,
+                      uint64_t seed, int max_frames,
+                      int verbose, int use_eos, const wchar_t* dump_frames,
+                      Player* pl, float** out_pcm, size_t* out_samples)
+{
+    float hidden[HIDDEN];
+    memcpy(hidden, st->hidden, sizeof(float) * HIDDEN);
+    OrtValue** kv = st->kv;
+    int32_t past_len = st->past_len;
+    uint64_t _t0;
     Rng rng;
     rng_seed(&rng, seed);
     EosDetector eos;
@@ -1814,8 +1828,6 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     OrtValue* t_audio  = MK_F32(u_audio, sh_rand, 2);
     OrtValue* t_step   = MK_I32(step_ids, sh_step, 3);
     OrtValue* t_pvl    = MK_I32(pvl_buf, sh_pvl, 1);
-
-    int32_t past_len = (int32_t)S;
 
     int16_t* out = (int16_t*)xmalloc(sizeof(int16_t) * (size_t)max_frames * N_VQ);
     size_t n_frames = 0;
@@ -1952,6 +1964,26 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
     *out_samples = sd_n;
     return n_frames;
 }
+/* 后台 prefill: 下一块的 prompt 预计算与上一块的帧循环并行,
+ * chunk 交界的等待从 '整个 prefill' 缩到 '取结果' (通常 0ms) */
+typedef struct {
+    Models* m;
+    int32_t* tids;
+    size_t nt;
+    const int16_t* ref;
+    size_t ref_frames;
+    GenPre st;
+    HANDLE done;
+} PreJob;
+
+static DWORD WINAPI prefill_worker(LPVOID p)
+{
+    PreJob* j = (PreJob*)p;
+    gen_prefill(j->m, j->tids, j->nt, j->ref, j->ref_frames, 0, &j->st);
+    SetEvent(j->done);
+    return 0;
+}
+
 /* codec 编码: 参考音频 -> codes */
 static int16_t* codec_encode(Models* m, const float* interleaved, size_t frames, size_t* out_frames)
 {
@@ -2486,22 +2518,43 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
     size_t total_samples = 0;
     float* all = NULL;
 
+    /* token 编码是毫秒级, 全部提前做; 下一块的 prefill 才能提前到后台跑 */
+    int32_t** tok = (int32_t**)xcalloc((size_t)nch, sizeof(int32_t*));
+    int* ntok = (int*)xcalloc((size_t)nch, sizeof(int));
     for (int ci = 0; ci < nch; ci++) {
-        int32_t* tids = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(chunks[ci]) * 2 + 16));
-        int nt = sp_encode(sp, chunks[ci], tids, (int)strlen(chunks[ci]) * 2 + 16);
-        if (nt <= 0) { free(tids); continue; }
+        tok[ci] = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(chunks[ci]) * 2 + 16));
+        ntok[ci] = sp_encode(sp, chunks[ci], tok[ci], (int)strlen(chunks[ci]) * 2 + 16);
+    }
+
+    PreJob job;
+    HANDLE hjob = NULL;
+
+    for (int ci = 0; ci < nch; ci++) {
+        int nt = ntok[ci];
+        if (nt <= 0) continue;
         if (verbose || nch > 1) printf("chunk %d/%d: %d tokens\n", ci + 1, nch, nt);
+
+        /* 上一块循环期间下一块的 prefill 已在后台跑完, 这里通常瞬间取走 */
+        GenPre st;
+        if (hjob) {
+            WaitForSingleObject(hjob, INFINITE);
+            CloseHandle(hjob);
+            hjob = NULL;
+            st = job.st;
+            /* job.tids 即 tok[ci], 所有权在 tok 表, 循环收尾统一 free (免双重释放) */
+        } else {
+            gen_prefill(m, tok[ci], (size_t)nt, ref, ref_frames, verbose, &st);
+        }
 
         uint64_t t1 = now_ms();
         float* pcm = NULL;
         size_t nsamp = 0;
-        size_t frames = generate_frames(m, tids, (size_t)nt, ref, ref_frames,
-                                        &pcm, &nsamp, seed, max_frames, verbose, use_eos,
-                                        dump_frames, pl);
+        size_t frames = gen_run(m, &st, seed, max_frames, verbose, use_eos,
+                                dump_frames, pl, &pcm, &nsamp);
         uint64_t t2 = now_ms();
         if (frames == 0 || !pcm || nsamp == 0) {
             fprintf(stderr, "  [warn] no frames generated for this chunk\n");
-            free(pcm); free(tids);
+            free(pcm);
             continue;
         }
         printf("  %zu frames -> %.2f s audio  (%llu ms)\n",
@@ -2522,10 +2575,31 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
         }
         all = merged;
 
-        free(pcm); free(tids);
+        free(pcm);
+
+        /* 下一块有货: prefill 丢后台, 与本块循环的收尾/下一轮并行 */
+        if (ci + 1 < nch && ntok[ci + 1] > 0) {
+            job.m = m;
+            job.tids = tok[ci + 1];
+            job.nt = (size_t)ntok[ci + 1];
+            job.ref = ref;
+            job.ref_frames = ref_frames;
+            job.done = CreateEvent(NULL, FALSE, FALSE, NULL);
+            HANDLE th = CreateThread(NULL, 0, prefill_worker, &job, 0, NULL);
+            if (th && job.done) {
+                CloseHandle(th);
+                hjob = job.done;
+            } else {
+                if (job.done) CloseHandle(job.done);
+                gen_prefill(m, tok[ci + 1], (size_t)ntok[ci + 1], ref, ref_frames, 0, &job.st);
+            }
+        }
     }
 
     for (int k = 0; k < nch; k++) free(chunks[k]);
+    for (int k = 0; k < nch; k++) free(tok[k]);
+    free(tok);
+    free(ntok);
     free(chunks);
 
     if (!all || total_samples == 0) return NULL;
@@ -2650,6 +2724,7 @@ static void usage(void)
 int wmain(int argc, wchar_t** argv)
 {
     SetConsoleOutputCP(CP_UTF8);
+    timeBeginPeriod(1);   /* 默认 15.6ms; 背压/等头的 Sleep(1) 要真睡 1ms */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     SetUnhandledExceptionFilter(crash_filter);
