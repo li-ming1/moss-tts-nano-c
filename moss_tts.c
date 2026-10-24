@@ -1534,6 +1534,22 @@ static void player_request(Player* p)
     p->emitted = 0;
 }
 
+/* 与文件输出同一套尾部裁剪: 最后一个 20ms 窗 RMS>1e-4 之后保留 0.2s */
+static size_t player_trim_tail(const float* pcm, size_t samples)
+{
+    const size_t win = SAMPLE_RATE / 50;          /* 20ms */
+    size_t last = 0;
+    for (size_t w = samples; w >= win; w -= win) {
+        double acc = 0.0;
+        for (size_t i = (w - win) * CHANNELS; i < w * CHANNELS; i++)
+            acc += (double)pcm[i] * (double)pcm[i];
+        if (acc / (double)(win * CHANNELS) > 1.0e-4) { last = w; break; }
+    }
+    if (last == 0) return 0;
+    size_t keep = last + SAMPLE_RATE / 5;
+    return keep < samples ? keep : samples;
+}
+
 static void pre_append(Player* p, const float* inter, size_t n)
 {
     if (p->pre_n + n > p->pre_cap) {
@@ -1571,7 +1587,9 @@ static void player_push(Player* p, const float* inter, size_t n, double energy)
     if (!p->live) return;
 
     if (p->prebuffering) {
-        /* 攒够 PL_PRE_SMPL 才开播; 期间扣住的静音一并按序进缓冲 */
+        /* 攒够 PL_PRE_SMPL 才开播; 期间扣住的静音一并按序进缓冲。
+         * 开播时最新一批照旧扣住 (见下), 出声时刻不变, 只是设备队列
+         * 里永远滞后一批 */
         if (p->hold_n) {
             pre_append(p, p->hold, p->hold_n);
             p->hold_n = 0;
@@ -1579,16 +1597,27 @@ static void player_push(Player* p, const float* inter, size_t n, double energy)
         pre_append(p, inter, n);
         if (p->pre_n >= PL_PRE_SMPL) {
             p->prebuffering = 0;
-            player_emit(p, p->pre, p->pre_n);
-            p->pre_n = 0;
+            size_t keep = n;                     /* 扣住最新一批 */
+            size_t emit_n = p->pre_n > keep ? p->pre_n - keep : 0;
+            if (emit_n) player_emit(p, p->pre, emit_n);
+            if (emit_n) memmove(p->pre, p->pre + emit_n * CHANNELS,
+                                sizeof(float) * (p->pre_n - emit_n) * CHANNELS);
+            p->pre_n -= emit_n;
         }
         return;
+    }
+    /* 流式: 最新一批扣在 pre 里; 下一批到来时放行上一批。收尾
+     * (player_drop_hold) 才对扣住的这批做窗口级尾部裁剪, 与文件
+     * 输出行为一致 -- 否则结尾那批"半个音节+杂音"会整批播出去 */
+    if (p->pre_n) {
+        player_emit(p, p->pre, p->pre_n);
+        p->pre_n = 0;
     }
     if (p->hold_n) {
         player_emit(p, p->hold, p->hold_n);
         p->hold_n = 0;
     }
-    player_emit(p, inter, n);
+    pre_append(p, inter, n);
 }
 
 static void player_on_audio(void* ctx, const float* inter, size_t n, double energy)
@@ -1742,10 +1771,12 @@ static void player_play_all(Player* p, const float* pcm, size_t n)
 static void player_drop_hold(Player* p)
 {
     p->hold_n = 0;
-    /* 没攒满 1s 的预缓冲要冲出去: 短句 (如 "你是谁" 只有 0.8s) 不冲就永远不播 */
-    if (p->prebuffering && p->pre_n > 0) {
+    /* 扣住的尾批按文件同款规则裁剪 (20ms 窗) 后放行; 没攒满预缓冲的
+     * 短句 (如 "你是谁" 0.8s) 也走同一裁剪, 不冲就永远不播 */
+    if (p->pre_n > 0) {
         p->prebuffering = 0;
-        if (p->live) player_emit(p, p->pre, p->pre_n);
+        size_t keep = player_trim_tail(p->pre, p->pre_n);
+        if (keep && p->live) player_emit(p, p->pre, keep);
         p->pre_n = 0;
     }
 }
@@ -3007,7 +3038,6 @@ int wmain(int argc, wchar_t** argv)
             }
 
             char* lnorm = normalize_for_tts(line);
-            printf("text      : %s\n", lnorm);
             uint64_t rq = now_ms();
             if (use_player) player_request(&player);
             size_t tot = 0;
