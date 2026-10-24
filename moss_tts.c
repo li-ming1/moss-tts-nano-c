@@ -1098,8 +1098,10 @@ static DWORD WINAPI load_worker(LPVOID p)
     return 0;
 }
 
-/* models/ 里放了 <name>.int8.onnx 就优先加载 (--fp32 强制原始精度) */
-static const wchar_t* pick_model(const wchar_t* dir, const wchar_t* base, int force_fp32)
+/* models/ 里放了 <name>.int8.onnx 就优先加载 (--fp32 强制原始精度)。
+ * 结果写入调用方给的缓冲 (并行加载时不能共用静态块)。 */
+static const wchar_t* pick_model(wchar_t* out, int cap, const wchar_t* dir,
+                                 const wchar_t* base, int force_fp32)
 {
     if (force_fp32) return base;
     wchar_t path[MAX_PATH * 2];
@@ -1107,13 +1109,14 @@ static const wchar_t* pick_model(const wchar_t* dir, const wchar_t* base, int fo
     if (dot) _snwprintf(path, MAX_PATH * 2, L"%ls\\%.*ls.int8.onnx", dir, (int)(dot - base), base);
     else     _snwprintf(path, MAX_PATH * 2, L"%ls\\%ls.int8.onnx", dir, base);
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-        static wchar_t name[MAX_PATH];
         const wchar_t* slash = wcsrchr(path, L'\\');
-        wcscpy(name, slash ? slash + 1 : path);
-        return name;
+        wcsncpy(out, slash ? slash + 1 : path, (size_t)cap - 1);
+        out[cap - 1] = 0;
+        return out;
     }
     return base;
 }
+
 
 static void models_open(Models* m, const wchar_t* dir, int threads, int force_fp32)
 {
@@ -1206,10 +1209,11 @@ static void models_open(Models* m, const wchar_t* dir, int threads, int force_fp
 
     /* 四个 session 互不依赖, 并行加载 (加载阶段是图优化 + I/O 混合, 单线程很浪费) */
     {
+        wchar_t dec_file[MAX_PATH], frame_file[MAX_PATH];
         LoadJob jobs[4] = {
             { &m->prefill, dir, L"moss_tts_prefill.onnx",                    threads, &g_stats.load_prefill, 0 },
-            { &m->decode,  dir, pick_model(dir, L"moss_tts_decode_step.onnx", force_fp32), threads, &g_stats.load_decode, 0 },
-            { &m->frame,   dir, L"moss_tts_local_fixed_sampled_frame.onnx",  threads, &g_stats.load_frame, 0 },
+            { &m->decode,  dir, pick_model(dec_file, MAX_PATH, dir, L"moss_tts_decode_step.onnx", force_fp32), threads, &g_stats.load_decode, 0 },
+            { &m->frame,   dir, pick_model(frame_file, MAX_PATH, dir, L"moss_tts_local_fixed_sampled_frame.onnx", force_fp32), threads, &g_stats.load_frame, 0 },
             { &m->dec,     dir, L"moss_audio_tokenizer_decode_step.onnx",    threads, &g_stats.load_dec, 0 },
         };
         HANDLE th[4];
