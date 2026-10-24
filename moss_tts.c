@@ -1050,6 +1050,13 @@ typedef struct {
     int threads;
 } Models;
 
+static void models_close(Models* m)
+{
+    Session* all[5] = { &m->prefill, &m->decode, &m->frame, &m->dec, &m->enc };
+    for (int k = 0; k < 5; k++)
+        if (all[k]->s) { ort->ReleaseSession(all[k]->s); all[k]->s = NULL; }
+}
+
 typedef struct {
     Session* S;
     const wchar_t* dir;
@@ -1157,12 +1164,11 @@ static void models_open(Models* m, const wchar_t* dir, int threads)
 
     /* 四个 session 互不依赖, 并行加载 (加载阶段是图优化 + I/O 混合, 单线程很浪费) */
     {
-        int cth = threads;
         LoadJob jobs[4] = {
             { &m->prefill, dir, L"moss_tts_prefill.onnx",                    threads, &g_stats.load_prefill, 0 },
             { &m->decode,  dir, L"moss_tts_decode_step.onnx",                threads, &g_stats.load_decode, 0 },
             { &m->frame,   dir, L"moss_tts_local_fixed_sampled_frame.onnx",  threads, &g_stats.load_frame, 0 },
-            { &m->dec,     dir, L"moss_audio_tokenizer_decode_step.onnx",    cth,     &g_stats.load_dec, 0 },
+            { &m->dec,     dir, L"moss_audio_tokenizer_decode_step.onnx",    threads, &g_stats.load_dec, 0 },
         };
         HANDLE th[4];
         int started = 0;
@@ -1579,9 +1585,9 @@ static size_t generate_frames(Models* m, const int32_t* text_ids, size_t n_text,
         g_stats.step += now_ms() - _t0;
         g_stats.steps++;
 
-        size_t dn = 0;
-        float* dh = (float*)tensor_data(dout[0], &dn);
-        if (dn >= (size_t)HIDDEN) memcpy(hidden, dh + dn - HIDDEN, sizeof(float) * HIDDEN);
+        /* global_hidden 恒为 [1,1,768], 不必再查 shape */
+        float* dh = (float*)tensor_data(dout[0], NULL);
+        memcpy(hidden, dh, sizeof(float) * HIDDEN);
 
         ort->ReleaseValue(dout[0]);
         for (int k = 0; k < GLOBAL_LAYERS * 2; k++) ort->ReleaseValue(kv[k]);
@@ -2014,6 +2020,7 @@ int wmain(int argc, wchar_t** argv)
     free(norm);
     free(text);
 
+    models_close(&models);
     if (g_meminfo) ort->ReleaseMemoryInfo(g_meminfo);
     if (g_env) ort->ReleaseEnv(g_env);
     return 0;
