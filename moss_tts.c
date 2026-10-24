@@ -1972,7 +1972,7 @@ static void usage(void)
         "\n"
         "  --out <file>        输出 wav (默认 out.wav)\n"
         "  --model-dir <dir>   模型目录 (默认 models)\n"
-        "  --voice <name>      内置音色 (默认 Junhao, 见 --list-voices)\n"
+        "  --voice <name>      内置音色 (默认 Yuewen, 见 --list-voices)\n"
         "  --ref-wav <file>    用自己的参考音频克隆音色 (优先于 --voice)\n"
         "  --list-voices       列出 manifest 里的全部内置音色\n"
         "  --seed <n>          随机种子 (默认 1234)\n"
@@ -1999,7 +1999,7 @@ int wmain(int argc, wchar_t** argv)
     uint64_t seed = 1234;
     int max_frames = MAX_FRAMES_DEF;
     int tokens_only = 0, verbose = 0, no_eos = 0, list_voices = 0;
-    const wchar_t* voice_w = L"Junhao";
+    const wchar_t* voice_w = L"Yuewen";   /* 默认音色: 台湾腔女声 */
     wchar_t dump_frames[MAX_PATH] = L"";
     int threads = 0;
 
@@ -2127,7 +2127,7 @@ int wmain(int argc, wchar_t** argv)
         ref = ref_owned;
         printf("voice     : %s (%zu 帧)\n", voice_u8, ref_frames);
     } else {
-        printf("voice     : Junhao (%zu 帧)\n", ref_frames);
+        printf("voice     : Yuewen (%zu 帧)\n", ref_frames);
     }
     free(voice_u8);
     printf("threads   : %d\n", threads);
