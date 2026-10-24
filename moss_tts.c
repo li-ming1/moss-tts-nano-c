@@ -1707,6 +1707,17 @@ static float* probe_finish(Probe* pr, size_t* out_samples)
 }
 
 /* 请求收尾: 丢弃扣住的尾部静音 (对应文件输出的尾部裁剪) */
+/* 守护模式: 短句完整生成并验证后再一次性播放 (绕过预缓冲/hold) */
+static void player_play_all(Player* p, const float* pcm, size_t n)
+{
+    if (n == 0) return;
+    if (!p->t_first) p->t_first = now_ms();
+    if (!p->live) return;
+    p->prebuffering = 0;
+    p->hold_n = 0;
+    player_emit(p, pcm, n);
+}
+
 static void player_drop_hold(Player* p)
 {
     p->hold_n = 0;
@@ -2555,11 +2566,32 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
             gen_prefill(m, tok[ci], (size_t)nt, ref, ref_frames, verbose, &st);
         }
 
+        /* 短句守护: 单块短文本先不带播放完整生成, 时长远超预期判定为
+         * 模型跑偏 (一句正常话后零碎冒音节, 静音/重复判据都拦不住),
+         * 换种子重试; 干净的结果再一次性播放。"输入什么说什么"优先于
+         * 短句的流式低延迟。 */
+        int guarded = (nch == 1 && nt <= 48);
+
         uint64_t t1 = now_ms();
         float* pcm = NULL;
         size_t nsamp = 0;
-        size_t frames = gen_run(m, &st, seed, max_frames, verbose, use_eos,
-                                dump_frames, pl, &pcm, &nsamp);
+        size_t frames = 0;
+        for (int attempt = 0; ; attempt++) {
+            if (attempt > 0) gen_prefill(m, tok[ci], (size_t)nt, ref, ref_frames, 0, &st);
+            double cap = (double)nt * 5.5 + 50.0;
+            /* 前两次尝试把帧数上限压到预期附近: 跑偏的早停早换, 别等它
+             * 完整吐完 147 帧才发现; 最后一次兜底放开全长 */
+            int mf = (guarded && attempt < 2) ? (int)(cap * 1.2) : max_frames;
+            frames = gen_run(m, &st, seed + (uint64_t)attempt, mf, verbose, use_eos,
+                             dump_frames, guarded ? NULL : pl, &pcm, &nsamp);
+            if (!guarded || attempt >= 2 || (double)frames <= cap)
+                break;
+            fprintf(stderr, "  [regen] 短句疑似跑偏 (%zu 帧 > 预期 %.0f), 换种子重试\n",
+                    frames, cap);
+            free(pcm);
+            pcm = NULL;
+        }
+        if (guarded && pl) player_play_all(pl, pcm, nsamp);
         uint64_t t2 = now_ms();
         if (frames == 0 || !pcm || nsamp == 0) {
             fprintf(stderr, "  [warn] no frames generated for this chunk\n");
