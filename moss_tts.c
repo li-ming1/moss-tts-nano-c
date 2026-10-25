@@ -49,6 +49,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <mmsystem.h>      /* waveOut 流式播放 */
+#include <wininet.h>       /* 对话模式 HTTPS */
 #include <io.h>            /* _isatty (server 模式判断交互终端) */
 #include <math.h>
 #include <stdint.h>
@@ -2762,6 +2763,237 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
 }
 
 /* ---------------------------------------------------------------------------
+ * 8.7 对话模式: 输入发给大模型, 回复用 TTS 实时说出来 (--chat, 配合 --server)
+ *
+ * API 为 xfyun MaaS 的 /v1/responses (OpenAI Responses 风格):
+ *   请求 {"model", "input": [消息数组], "stream": false}
+ *   回复顶层 output_text = 最终答案 (summary 里是推理模型的思维链, 不能读)
+ * 多轮上下文保留最近 CHAT_HIST_MAX 条; /reset 清空, /say <文本> 跳过大模型
+ * 直接朗读。密钥来自 --api-key 或环境变量 CHAT_API_KEY, 不写进仓库。
+ * -------------------------------------------------------------------------*/
+#define CHAT_HIST_MAX 16
+
+typedef struct {
+    char* role;                  /* "user" / "assistant" */
+    char* content;
+} ChatMsg;
+
+typedef struct {
+    ChatMsg hist[CHAT_HIST_MAX];
+    int     n;
+    int     drop;                /* 环形队列起点 */
+    char    host[160];
+    char    path[160];
+    char    model[64];
+    char    key[160];
+} Chat;
+
+static void chat_init(Chat* c, const wchar_t* api_url, const wchar_t* api_model,
+                      const wchar_t* api_key_w)
+{
+    memset(c, 0, sizeof(*c));
+    strcpy(c->host, "maas-api.cn-huabei-1.xf-yun.com");
+    strcpy(c->path, "/v1/responses");
+    strcpy(c->model, "spark-x2.6");
+
+    if (api_url && api_url[0]) {
+        char* u = w2u(api_url);
+        if (u) {
+            const char* hp = u;
+            if (!strncmp(hp, "https://", 8)) hp += 8;
+            const char* slash = strchr(hp, '/');
+            if (slash) {
+                size_t hl = (size_t)(slash - hp);
+                if (hl > 0 && hl < sizeof(c->host)) {
+                    memcpy(c->host, hp, hl);
+                    c->host[hl] = 0;
+                    strncpy(c->path, slash, sizeof(c->path) - 1);
+                    c->path[sizeof(c->path) - 1] = 0;
+                }
+            }
+            free(u);
+        }
+    }
+    if (api_model && api_model[0]) {
+        char* m = w2u(api_model);
+        if (m) { strncpy(c->model, m, sizeof(c->model) - 1); c->model[sizeof(c->model) - 1] = 0; free(m); }
+    }
+    if (api_key_w && api_key_w[0]) {
+        char* k = w2u(api_key_w);
+        if (k) { strncpy(c->key, k, sizeof(c->key) - 1); c->key[sizeof(c->key) - 1] = 0; free(k); }
+    } else {
+        const char* env = getenv("CHAT_API_KEY");
+        if (env) strncpy(c->key, env, sizeof(c->key) - 1), c->key[sizeof(c->key) - 1] = 0;
+    }
+}
+
+static void chat_push(Chat* c, const char* role, const char* content)
+{
+    if (c->n < CHAT_HIST_MAX) {
+        c->hist[c->n].role = _strdup(role);
+        c->hist[c->n].content = _strdup(content);
+        c->n++;
+    } else {
+        free(c->hist[c->drop].role);
+        free(c->hist[c->drop].content);
+        c->hist[c->drop].role = _strdup(role);
+        c->hist[c->drop].content = _strdup(content);
+        c->drop = (c->drop + 1) % CHAT_HIST_MAX;
+    }
+}
+
+static void chat_reset(Chat* c)
+{
+    for (int i = 0; i < c->n; i++) {
+        free(c->hist[i].role);
+        free(c->hist[i].content);
+    }
+    c->n = 0;
+    c->drop = 0;
+    printf("chat     : 对话已清空\n");
+}
+
+/* POST JSON 并读回整个响应体 (NUL 结尾); 失败返回 NULL */
+static char* chat_post(Chat* c, const char* body)
+{
+    DWORD tmo = 30000;
+    HINTERNET net = InternetOpenA("moss_tts", INTERNET_OPEN_TYPE_PRECONFIG,
+                                  NULL, NULL, 0);
+    if (!net) { fprintf(stderr, "  [chat] InternetOpen 失败\n"); return NULL; }
+    InternetSetOptionA(net, INTERNET_OPTION_CONNECT_TIMEOUT, &tmo, sizeof(tmo));
+    InternetSetOptionA(net, INTERNET_OPTION_RECEIVE_TIMEOUT, &tmo, sizeof(tmo));
+    InternetSetOptionA(net, INTERNET_OPTION_SEND_TIMEOUT, &tmo, sizeof(tmo));
+
+    HINTERNET conn = InternetConnectA(net, c->host, INTERNET_DEFAULT_HTTPS_PORT,
+                                      NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!conn) {
+        fprintf(stderr, "  [chat] 连不上 %s\n", c->host);
+        InternetCloseHandle(net);
+        return NULL;
+    }
+    HINTERNET req = HttpOpenRequestA(conn, "POST", c->path, NULL, NULL, NULL,
+                                     INTERNET_FLAG_SECURE |
+                                     INTERNET_FLAG_RELOAD, 0);
+    if (!req) { InternetCloseHandle(conn); InternetCloseHandle(net); return NULL; }
+
+    char hdr[512];
+    snprintf(hdr, sizeof(hdr),
+             "Content-Type: application/json\r\nAuthorization: Bearer %s\r\n",
+             c->key);
+    HttpAddRequestHeadersA(req, hdr, (DWORD)-1L, HTTP_ADDREQ_FLAG_ADD);
+
+    char* resp = NULL;
+    if (!HttpSendRequestA(req, NULL, 0, (void*)body, (DWORD)strlen(body))) {
+        fprintf(stderr, "  [chat] 请求发送失败 (%lu)\n", GetLastError());
+        goto done;
+    }
+    {
+        DWORD st = 0, sz = sizeof(st);
+        HttpQueryInfoA(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                       &st, &sz, 0);
+        if (st != 200) {
+            fprintf(stderr, "  [chat] HTTP %lu\n", st);
+            goto done;
+        }
+    }
+    {
+        size_t cap = 1 << 16, len = 0;
+        resp = (char*)xmalloc(cap);
+        for (;;) {
+            if (len + 4096 + 1 > cap) {
+                cap *= 2;
+                char* nb = (char*)realloc(resp, cap);
+                if (!nb) die("out of memory");
+                resp = nb;
+            }
+            DWORD got = 0;
+            if (!InternetReadFile(req, resp + len, (DWORD)(cap - len - 1), &got))
+                break;
+            if (got == 0) break;
+            len += got;
+        }
+        resp[len] = 0;
+        if (len == 0) { free(resp); resp = NULL; }
+    }
+
+done:
+    InternetCloseHandle(req);
+    InternetCloseHandle(conn);
+    InternetCloseHandle(net);
+    return resp;
+}
+
+/* 去掉增补平面字符 (emoji 等, 4 字节 UTF-8): 进 TTS 无意义还可能出怪音 */
+static void strip_emoji(char* s)
+{
+    char* w = s;
+    for (const unsigned char* r = (const unsigned char*)s; *r; ) {
+        if (r[0] >= 0xF0) {              /* 4 字节序列整体跳过 */
+            int k = 1;
+            while (r[k] && (r[k] & 0xC0) == 0x80 && k < 4) k++;
+            r += k;
+            continue;
+        }
+        *w++ = (char)*r++;
+    }
+    *w = 0;
+}
+
+/* 提取最终答案: 顶层 output_text; 退化时取第一个 text (summary 之外也可能有) */
+static char* chat_reply_text(const char* resp)
+{
+    const char* end = resp + strlen(resp);
+    char out[32768];
+    if (js_find_str(resp, end, "output_text", out, sizeof(out)) && out[0])
+        return _strdup(out);
+    if (js_find_str(resp, end, "text", out, sizeof(out)) && out[0])
+        return _strdup(out);
+    return NULL;
+}
+
+/* 组请求体: {"model":"...","input":[{"role":..,"content":..}, ...],"stream":false} */
+static char* chat_build_body(Chat* c)
+{
+    size_t cap = 1 << 16, len = 0;
+    char* b = (char*)xmalloc(cap);
+    b[0] = 0;
+    char esc[16384];
+
+#define BAPPEND(s)                                                          \
+    do {                                                                     \
+        size_t _n = strlen(s);                                               \
+        while (len + _n + 1 > cap) {                                         \
+            cap *= 2;                                                        \
+            char* nb = (char*)realloc(b, cap);                               \
+            if (!nb) die("out of memory");                                   \
+            b = nb;                                                          \
+        }                                                                    \
+        memcpy(b + len, s, _n);                                              \
+        len += _n;                                                           \
+        b[len] = 0;                                                          \
+    } while (0)
+
+    BAPPEND("{\"model\":\"");
+    json_escape_into(c->model, esc, (int)sizeof(esc));
+    BAPPEND(esc);
+    BAPPEND("\",\"input\":[");
+    for (int i = 0; i < c->n; i++) {
+        ChatMsg* m = &c->hist[(c->drop + i) % CHAT_HIST_MAX];
+        if (c->n < CHAT_HIST_MAX) m = &c->hist[i];
+        if (i) BAPPEND(",");
+        BAPPEND("{\"role\":\"");
+        BAPPEND(m->role);
+        BAPPEND("\",\"content\":\"");
+        json_escape_into(m->content, esc, (int)sizeof(esc));
+        BAPPEND(esc);
+        BAPPEND("\"}");
+    }
+    BAPPEND("],\"stream\":false}");
+#undef BAPPEND
+    return b;
+}
+
+/* ---------------------------------------------------------------------------
  * 8.6 P 核自动钉核
  *
  * Intel 12 代起的混合架构: P 核带超线程 (1 物理 2 逻辑), E 核没有 (1:1)。
@@ -2829,6 +3061,10 @@ static void usage(void)
         "  --list-voices       列出 manifest 里的全部内置音色\n"
         "  --play              边生成边播放 (RTF<1, 流式不卡顿)\n"
         "  --server            常驻模式: 每行一段文本, 模型只加载一次 (含 --play)\n"
+        "  --chat              对话模式 (配合 --server): 输入发给大模型, 回复实时语音播报\n"
+        "  --api-key <k>       对话模式密钥 (或环境变量 CHAT_API_KEY)\n"
+        "  --api-url <u>       对话 API 地址 (默认 xfyun /v1/responses)\n"
+        "  --api-model <m>     对话模型 (默认 spark-x2.6)\n"
         "  --no-play           配合 --server: 只合成不播放\n"
         "  --fp32              强制原始精度 (models/ 有 .int8.onnx 变体时默认用 int8)\n"
         "  --seed <n>          随机种子 (默认 1234)\n"
@@ -2859,7 +3095,8 @@ int wmain(int argc, wchar_t** argv)
     uint64_t seed = 1234;
     int max_frames = MAX_FRAMES_DEF;
     int tokens_only = 0, verbose = 0, no_eos = 0, list_voices = 0;
-    int play = 0, server = 0, no_play = 0, out_given = 0, fp32 = 0;
+    int play = 0, server = 0, no_play = 0, out_given = 0, fp32 = 0, chat_on = 0;
+    wchar_t api_key[160] = L"", api_url[200] = L"", api_model[64] = L"";
     const wchar_t* voice_w = L"神里绫华";   /* 默认音色: 用户克隆的音色 */
     wchar_t dump_frames[MAX_PATH] = L"";
     int threads = 0;
@@ -2883,6 +3120,10 @@ int wmain(int argc, wchar_t** argv)
                 else if (!wcscmp(a, L"--server")) { server = 1; }
                 else if (!wcscmp(a, L"--no-play")) { no_play = 1; }
                 else if (!wcscmp(a, L"--fp32")) { fp32 = 1; }
+                else if (!wcscmp(a, L"--chat")) { chat_on = 1; }
+                else if (!wcscmp(a, L"--api-key") && i + 1 < argc) { wcscpy(api_key, argv[++i]); }
+                else if (!wcscmp(a, L"--api-url") && i + 1 < argc) { wcscpy(api_url, argv[++i]); }
+                else if (!wcscmp(a, L"--api-model") && i + 1 < argc) { wcscpy(api_model, argv[++i]); }
                 else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
                 else if (!wcscmp(a, L"--max-frames") && i + 1 < argc) { max_frames = _wtoi(argv[++i]); }
                 else if (!wcscmp(a, L"--threads") && i + 1 < argc) { threads = _wtoi(argv[++i]); }
@@ -3029,6 +3270,17 @@ int wmain(int argc, wchar_t** argv)
         SetConsoleCP(CP_UTF8);        /* 交互终端下让 stdin 按 UTF-8 收 */
         SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
         printf("server    : 每行一段文本回车合成; /voice <名> 换音色, /seed <n> 换种子, /quit 退出\n");
+        Chat chat;
+        if (chat_on) {
+            chat_init(&chat, api_url, api_model, api_key);
+            if (!chat.key[0]) {
+                fprintf(stderr, "[chat] 缺少 API key (--api-key 或环境变量 CHAT_API_KEY), 对话模式未开启\n");
+                chat_on = 0;
+            } else {
+                printf("chat      : %s%s (模型 %s); 直接输入对话, /reset 清空, /say <文本> 跳过大模型直接朗读\n",
+                       chat.host, chat.path, chat.model);
+            }
+        }
         char line[16384];
         int req = 0;
         int tty = _isatty(_fileno(stdin));
@@ -3039,9 +3291,18 @@ int wmain(int argc, wchar_t** argv)
             while (ll && (line[ll - 1] == '\n' || line[ll - 1] == '\r')) line[--ll] = 0;
             if (!ll) continue;
 
+            int direct_say = 0;
             if (line[0] == '/') {
                 if (!strncmp(line, "/quit", 5)) break;
-                if (!strncmp(line, "/voice", 6) && (line[6] == ' ' || line[6] == '\t')) {
+                if (!strncmp(line, "/say", 4) && (line[4] == ' ' || line[4] == '\t')) {
+                    memmove(line, line + 5, strlen(line + 5) + 1);
+                    ll = strlen(line);
+                    if (!ll) continue;
+                    direct_say = 1;      /* 跳过大模型直接朗读 */
+                } else if (!strncmp(line, "/reset", 6) && chat_on) {
+                    chat_reset(&chat);
+                    continue;
+                } else if (!strncmp(line, "/voice", 6) && (line[6] == ' ' || line[6] == '\t')) {
                     const char* vn = line + 6;
                     while (*vn == ' ' || *vn == '\t') vn++;
                     wchar_t* vw = u2w(vn);
@@ -3055,16 +3316,41 @@ int wmain(int argc, wchar_t** argv)
                         ref_frames = nfr;
                     }
                     free(vw);
+                    continue;
                 } else if (!strncmp(line, "/seed", 5) && (line[5] == ' ' || line[5] == '\t')) {
                     seed = _strtoui64(line + 5, NULL, 10);
                     printf("seed      : %llu\n", (unsigned long long)seed);
+                    continue;
                 } else {
-                    fprintf(stderr, "未知命令: %s (可用: /voice <名> /seed <n> /quit)\n", line);
+                    fprintf(stderr, "未知命令: %s (可用: /voice <名> /seed <n> /reset /say <文本> /quit)\n", line);
+                    continue;
                 }
-                continue;
             }
 
-            char* lnorm = normalize_for_tts(line);
+            /* 朗读对象: 对话模式取大模型回复, /say 或普通模式取原文 */
+            char* speak = line;
+            char* speak_owned = NULL;
+            if (!direct_say && chat_on) {
+                uint64_t tq = now_ms();
+                chat_push(&chat, "user", line);
+                char* body = chat_build_body(&chat);
+                char* resp = chat_post(&chat, body);
+                char* reply = resp ? chat_reply_text(resp) : NULL;
+                free(body);
+                free(resp);
+                if (!reply) {
+                    fprintf(stderr, "  [chat] 没拿到回复, 这句跳过\n");
+                    continue;
+                }
+                printf("AI       : %s  (%llu ms)\n", reply,
+                       (unsigned long long)(now_ms() - tq));
+                strip_emoji(reply);
+                chat_push(&chat, "assistant", reply);
+                speak_owned = reply;
+                speak = reply;
+            }
+            char* lnorm = normalize_for_tts(speak);
+            free(speak_owned);
             uint64_t rq = now_ms();
             if (use_player) player_request(&player);
             size_t tot = 0;

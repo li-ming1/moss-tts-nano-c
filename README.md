@@ -25,6 +25,18 @@ moss_tts.exe --list-voices                   # 列出全部内置音色
 `/seed <n>` 换种子、`/quit` 退出;带 `--out x.wav` 时每条请求写 `x_001.wav…`。
 `[stats]` 行报告首字延迟、生成/播放时长与 RTF。
 
+**对话模式**(`--chat`,配合 `--server`):输入发给大模型,回复用当前音色实时
+语音播报,支持多轮上下文(`/reset` 清空),`/say <文本>` 跳过大模型直接朗读:
+
+```
+moss_tts.exe --server --chat --api-key ak-xxxx
+> 你好,介绍一下你自己          <- 打字,大模型回复被语音播出
+```
+
+密钥来自 `--api-key` 或环境变量 `CHAT_API_KEY`(不要写进仓库);API 地址与
+模型可用 `--api-url` / `--api-model` 覆盖,默认 xfyun MaaS `/v1/responses`
+(`spark-x2.6`,取回复的 `output_text` 字段,跳过推理思维链)。
+
 ## 音色
 
 - 18 个官方预置音色(6 中/5 英/7 日)存于 `models/browser_poc_manifest.json`,
