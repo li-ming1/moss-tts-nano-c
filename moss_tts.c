@@ -3368,6 +3368,64 @@ static DWORD WINAPI sse_worker(LPVOID p)
     return 0;
 }
 
+/* 聊天句清理: 剥离开头的填充词 (嗯,/呃, 等 LLM 口头禅); 整句只剩语气词
+ * 或标点则清空 (调用方跳过不播)。模型在音频层自插的 "嗯" 拦不住。 */
+static int filler_head(const char* p)
+{
+    static const char* k_f[] = {
+        "\xe5\x97\xaf",   /* 嗯 */
+        "\xe5\x91\x83",   /* 呃 */
+        "\xe5\x95\x8a",   /* 啊 */
+        "\xe5\x93\xa6",   /* 哦 */
+        "\xe5\x99\xa2",   /* 噢 */
+    };
+    for (int i = 0; i < 5; i++) if (!strncmp(p, k_f[i], 3)) return 1;
+    return 0;
+}
+
+static int sep_byte(const char* p)
+{
+    if (p[0] == ',' || p[0] == '.' || p[0] == '~' || p[0] == '!' || p[0] == '?') return 1;
+    if (!strncmp(p, "\xef\xbc\x8c", 3)) return 3;   /* ， */
+    if (!strncmp(p, "\xe3\x80\x82", 3)) return 3;   /* 。 */
+    if (!strncmp(p, "\xef\xbd\x9e", 3)) return 3;   /* ～ */
+    if (!strncmp(p, "\xe3\x80\x81", 3)) return 3;   /* 、 */
+    if (!strncmp(p, "\xef\xbc\x81", 3)) return 3;   /* ！ */
+    if (!strncmp(p, "\xef\xbc\x9f", 3)) return 3;   /* ？ */
+    return 0;
+}
+
+static void chat_clean_sentence(char* s)
+{
+    size_t i = 0;
+    for (;;) {
+        while (s[i] == ' ' || s[i] == '\t') i++;
+        if (!filler_head(s + i)) break;
+        i += 3;
+        for (;;) {
+            if (s[i] == ',' || s[i] == '.' || s[i] == '~' ||
+                s[i] == '!' || s[i] == '?') { i++; continue; }
+            int n = sep_byte(s + i);
+            if (n) { i += (size_t)n; continue; }
+            break;
+        }
+    }
+    if (i) memmove(s, s + i, strlen(s + i) + 1);
+
+    /* 剩下的若全是语气词/标点 -> 整句丢弃 */
+    size_t j = 0;
+    int speech = 0;
+    while (s[j]) {
+        if (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') { j++; continue; }
+        if (filler_head(s + j)) { j += 3; continue; }
+        int n = sep_byte(s + j);
+        if (n) { j += (size_t)n; continue; }
+        speech = 1;
+        break;
+    }
+    if (!speech) s[0] = 0;
+}
+
 /* ---------------------------------------------------------------------------
  * 8.6 P 核自动钉核
  *
@@ -3646,7 +3704,7 @@ int wmain(int argc, wchar_t** argv)
         /* 常驻模式: 模型只加载一次, 每行一段文本; 热启动后免掉 3s+ 的加载 */
         SetConsoleCP(CP_UTF8);        /* 交互终端下让 stdin 按 UTF-8 收 */
         SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
-        printf("server    : 每行一段文本回车合成; /voice <名> 换音色, /seed <n> 换种子, /quit 退出\n");
+        printf("server    : /voice <名> 换音色, /seed <n> 换种子, /retry 换种子重说上一句, /quit 退出\n");
         /* 预热: ORT 首次 Run 要建执行计划, 不预热的话首请求首字 ~2.6s */
         {
             uint64_t tw = now_ms();
@@ -3668,6 +3726,9 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         char line[16384];
+        char last_spoken[4096];
+        uint64_t retry_n = 0;
+        last_spoken[0] = 0;
         int req = 0;
         int tty = _isatty(_fileno(stdin));
         for (;;) {
@@ -3687,6 +3748,17 @@ int wmain(int argc, wchar_t** argv)
                     direct_say = 1;      /* 跳过大模型直接朗读 */
                 } else if (!strncmp(line, "/reset", 6) && chat_on) {
                     chat_reset(&chat);
+                    continue;
+                } else if (!strncmp(line, "/retry", 6)) {
+                    if (last_spoken[0]) {
+                        retry_n++;
+                        speak_text(&models, &sp, last_spoken, ref, ref_frames,
+                                   seed + retry_n, max_frames, verbose, !no_eos,
+                                   pl, out_given, out_path, &req, NULL, 0, 0);
+                        player_drain(&player);
+                    } else {
+                        fprintf(stderr, "还没有说过话\n");
+                    }
                     continue;
                 } else if (!strncmp(line, "/voice", 6) && (line[6] == ' ' || line[6] == '\t')) {
                     const char* vn = line + 6;
@@ -3708,7 +3780,7 @@ int wmain(int argc, wchar_t** argv)
                     printf("seed      : %llu\n", (unsigned long long)seed);
                     continue;
                 } else {
-                    fprintf(stderr, "未知命令: %s (可用: /voice <名> /seed <n> /reset /say <文本> /quit)\n", line);
+                    fprintf(stderr, "未知命令: %s (可用: /voice /seed /retry /reset /say <文本> /quit)\n", line);
                     continue;
                 }
             }
@@ -3733,6 +3805,11 @@ int wmain(int argc, wchar_t** argv)
                 for (;;) {
                     char* s = sq_pop(&sq);
                     if (!s) break;
+                    chat_clean_sentence(s);
+                    if (!s[0]) { free(s); continue; }
+                    strncpy(last_spoken, s, sizeof(last_spoken) - 1);
+                    last_spoken[sizeof(last_spoken) - 1] = 0;
+                    retry_n = 0;
                     if (ts.n == 0)
                         printf("AI (首句): %s\n", s);
                     speak_text(&models, &sp, s, ref, ref_frames, seed, max_frames,
@@ -3782,6 +3859,9 @@ int wmain(int argc, wchar_t** argv)
             }
 
             /* /say 与非对话模式: 直接朗读原文 */
+            strncpy(last_spoken, line, sizeof(last_spoken) - 1);
+            last_spoken[sizeof(last_spoken) - 1] = 0;
+            retry_n = 0;
             speak_text(&models, &sp, line, ref, ref_frames, seed, max_frames,
                        verbose, !no_eos, pl, out_given, out_path, &req, NULL, 0, 0);
             player_drain(&player);
