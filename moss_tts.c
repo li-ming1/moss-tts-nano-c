@@ -1099,21 +1099,25 @@ static DWORD WINAPI load_worker(LPVOID p)
     return 0;
 }
 
-/* models/ 里放了 <name>.int8.onnx 就优先加载 (--fp32 强制原始精度)。
+/* models/ 里放了 <name>.int4.onnx 或 <name>.int8.onnx 就优先加载
+ * (int4 先找, 再 int8; --fp32 强制原始精度)。
  * 结果写入调用方给的缓冲 (并行加载时不能共用静态块)。 */
 static const wchar_t* pick_model(wchar_t* out, int cap, const wchar_t* dir,
                                  const wchar_t* base, int force_fp32)
 {
     if (force_fp32) return base;
-    wchar_t path[MAX_PATH * 2];
-    const wchar_t* dot = wcsrchr(base, L'.');
-    if (dot) _snwprintf(path, MAX_PATH * 2, L"%ls\\%.*ls.int8.onnx", dir, (int)(dot - base), base);
-    else     _snwprintf(path, MAX_PATH * 2, L"%ls\\%ls.int8.onnx", dir, base);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-        const wchar_t* slash = wcsrchr(path, L'\\');
-        wcsncpy(out, slash ? slash + 1 : path, (size_t)cap - 1);
-        out[cap - 1] = 0;
-        return out;
+    static const wchar_t* k_ext[] = { L".int4.onnx", L".int8.onnx" };
+    for (int e = 0; e < 2; e++) {
+        wchar_t path[MAX_PATH * 2];
+        const wchar_t* dot = wcsrchr(base, L'.');
+        if (dot) _snwprintf(path, MAX_PATH * 2, L"%ls\\%.*ls%ls", dir, (int)(dot - base), base, k_ext[e]);
+        else     _snwprintf(path, MAX_PATH * 2, L"%ls\\%ls%ls", dir, base, k_ext[e]);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            const wchar_t* slash = wcsrchr(path, L'\\');
+            wcsncpy(out, slash ? slash + 1 : path, (size_t)cap - 1);
+            out[cap - 1] = 0;
+            return out;
+        }
     }
     return base;
 }
