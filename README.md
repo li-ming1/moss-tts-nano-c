@@ -82,10 +82,14 @@ moss_tts.exe --ref-wav 声音.wav --save-voice 新音色 "试听一句话"   # �
 | 图 | 变体 | 实测 |
 |---|---|---|
 | decode_step | `.int8.onnx`(动态量化) | decode步 21.7→13.9ms(-36%,AVX-VNNI) |
-| 采样 frame | `.int4.onnx`(MatMulNBits, block32) | 采样帧 33.5→29.2ms(-13%) |
+| 采样 frame | `.int4.onnx`(MatMulNBits, **block128**, accuracy_level=4) | 采样帧 33.5→~23ms(-30%, 分档实测) |
 
 量化输出与 fp32 是同文本的不同演绎(自回归采样对扰动混沌放大),音质
-取舍需自行试听。注意:性能对比必须同负载窗口背靠背做,本机 fp32 采样
+取舍需自行试听。调参结论(同窗口交替实测): accuracy_level 4(浮点反量化
+计算)比 auto/int8 档快 ~14%;block 128 比 32 快 ~12%(更粗,听感需自行
+确认,回退件 `moss_tts_local_fixed_sampled_frame.int4.b32.bak`);decode
+配 int4 与 int8 打平(int8 已吃到 AVX-VNNI),保持 int8。注意:性能对比
+必须同负载窗口背靠背做,本机 fp32 采样
 耗时随负载在 25~35ms 漂移,跨窗口对比会得出错误结论(实测踩过)。
 
 关键设计(详见源码头注释): 四 session 并行加载、逐帧复用输入张量、

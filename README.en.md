@@ -100,10 +100,14 @@ the file reverts one graph):
 | Graph | Variant | Measured |
 |---|---|---|
 | decode_step | `.int8.onnx` (dynamic) | 21.7→13.9ms per step (−36%, AVX-VNNI) |
-| sampling frame | `.int4.onnx` (MatMulNBits, block32) | 33.5→29.2ms per frame (−13%) |
+| sampling frame | `.int4.onnx` (MatMulNBits, **block128**, accuracy_level=4) | 33.5→~23ms per frame (−30%) |
 
 Quantized output is a different rendition of the same text (autoregressive
-sampling amplifies perturbation chaotically), so judge quality by ear. Note:
+sampling amplifies perturbation chaotically), so judge quality by ear.
+Tuning findings (interleaved same-window): accuracy_level 4 (float dequant)
+beats auto/int8 compute by ~14%; block 128 beats 32 by ~12% (coarser — verify
+by ear; fallback kept as `*.int4.b32.bak`); int4 on decode ties int8 (int8
+already rides AVX-VNNI), so decode stays int8. Note:
 benchmark only back-to-back within the same load window — on this machine the
 fp32 sampling time drifts 25–35ms with background load, and cross-window
 comparisons produce wrong conclusions (learned the hard way).
