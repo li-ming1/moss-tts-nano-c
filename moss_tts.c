@@ -1127,6 +1127,11 @@ static void models_open(Models* m, const wchar_t* dir, int threads, int force_fp
 {
     memset(m, 0, sizeof(*m));
     ort_load();
+    int probe_threads = threads;
+    {
+        const char* e = getenv("MOSS_PROBE_THREADS");
+        if (e && atoi(e) > 0) probe_threads = atoi(e);
+    }
 
     /* --- prefill: input_ids[1,S,17], attention_mask[1,S] -> hidden + 12*(k,v) --- */
     m->prefill.n_in = 2;
@@ -1219,7 +1224,9 @@ static void models_open(Models* m, const wchar_t* dir, int threads, int force_fp
             { &m->prefill, dir, L"moss_tts_prefill.onnx",                    threads, &g_stats.load_prefill, 0 },
             { &m->decode,  dir, pick_model(dec_file, MAX_PATH, dir, L"moss_tts_decode_step.onnx", force_fp32), threads, &g_stats.load_decode, 0 },
             { &m->frame,   dir, pick_model(frame_file, MAX_PATH, dir, L"moss_tts_local_fixed_sampled_frame.onnx", force_fp32), threads, &g_stats.load_frame, 0 },
-            { &m->dec,     dir, L"moss_audio_tokenizer_decode_step.onnx",    threads, &g_stats.load_dec, 0 },
+            /* codec 解码在异步线程跑, 与主循环抢核; 它有 ~6x 时间余量,
+             * 线程减半给主循环让路 (环境变量 MOSS_PROBE_THREADS 可调) */
+            { &m->dec,     dir, L"moss_audio_tokenizer_decode_step.onnx",    probe_threads, &g_stats.load_dec, 0 },
         };
         HANDLE th[4];
         int started = 0;
@@ -1706,7 +1713,7 @@ typedef struct {
     CRITICAL_SECTION cs;
     HANDLE    wake;                      /* auto-reset: 有作业或要退出 */
     HANDLE    th;
-    int16_t   job[MOSS_SD_BATCH * N_VQ]; /* 待取作业 (深度 1) */
+    int16_t   job[32 * N_VQ];           /* 待取作业 (深度 1, 上限 32 帧) */
     int       job_n;
     int       queued;
     int       stop;
@@ -1720,7 +1727,7 @@ static DWORD WINAPI probe_worker(LPVOID p)
     int consec = 0;
     for (;;) {
         WaitForSingleObject(pr->wake, INFINITE);
-        int16_t buf[MOSS_SD_BATCH * N_VQ];
+        int16_t buf[32 * N_VQ];
         int n = 0, stop = 0;
         EnterCriticalSection(&pr->cs);
         if (pr->queued) {
@@ -1945,11 +1952,22 @@ static size_t gen_run(Models* m, GenPre* st,
     Probe probe;
     probe_start(&probe, m, pl);
 
-    /* 待解码的帧: 攒够 SD_BATCH 帧一起解码 (太小调度开销大, 太大峰值内存高) */
-    enum { SD_BATCH = MOSS_SD_BATCH };
-    int16_t pend[SD_BATCH * N_VQ];
+    /* 待解码的帧: 攒够一批一起解码 (太小调度开销大, 太大峰值内存高)。
+     * MOSS_SD_BATCH 环境变量可调 (4..32, 默认 16)。 */
+    static int sd_batch = -1;
+    if (sd_batch < 0) {
+        sd_batch = MOSS_SD_BATCH;
+        const char* e = getenv("MOSS_SD_BATCH");
+        if (e) {
+            int v = atoi(e);
+            if (v >= 4 && v <= 32) sd_batch = v;
+        }
+    }
+    enum { SD_BATCH_MAX = 32 };
+    const int SD_BATCH = sd_batch;
+    int16_t pend[SD_BATCH_MAX * N_VQ];
     int n_pend = 0;
-    int batch_goal = 4;             /* 前几批小批量: 4 -> 8 -> 16 */
+    int batch_goal = 4;             /* 前几批小批量: 4 -> 8 -> 批上限 */
 
     for (int step = 0; step < max_frames; step++) {
         u_asst[0] = rng_u(&rng);
