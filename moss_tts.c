@@ -1242,6 +1242,8 @@ static void models_open(Models* m, const wchar_t* dir, int threads, int force_fp
     m->threads = threads;
 }
 
+static int g_quiet_gen;   /* chat UI 轮次内 =1: 屏蔽合成过程打印, 不打断流式渲染 */
+
 /* 语音结束检测 (对应 Rust EndOfSpeechDetector, 但窗口从 8 帧放宽到 48 帧)。
  *
  * 原实现用 8 帧 (0.64s) 判断第一通道重复率, 会把句子之间的停顿误判成结束:
@@ -2247,21 +2249,18 @@ static const char* js_read_str(const char* p, const char* end, char* out, int ca
     p++;
     int n = 0;
     while (p < end && *p != '"') {
-        if (*p == '\\' && p + 1 < end) {
+        if (*p == '\\' && p + 1 < end) {    /* JSON 转义解码 (回复里有 \n 等) */
             p++;
-            int esc = 1;                    /* JSON 转义解码 (对话回复里有换行等) */
-            if (*p == 'n') { if (n < cap) out[n++] = '\n'; }
-            else if (*p == 't') { if (n < cap) out[n++] = '\t'; }
-            else if (*p == 'r') { if (n < cap) out[n++] = '\r'; }
-            else if (*p == 'u') {           /* \uXXXX: 模型直接出 UTF-8, 这里兜底 */
+            if (*p == 'n') { if (n < cap) out[n++] = '\n'; p++; continue; }
+            if (*p == 't') { if (n < cap) out[n++] = '\t'; p++; continue; }
+            if (*p == 'r') { if (n < cap) out[n++] = '\r'; p++; continue; }
+            if (*p == 'u') {               /* \uXXXX: 模型直出 UTF-8, 兜底跳过 */
                 p++;
                 for (int k = 0; k < 4 && p < end; k++, p++) {}
                 if (n < cap) out[n++] = '?';
-                esc = 0;
+                continue;
             }
-            if (esc && n < cap) out[n++] = *p;
-            p++;
-            continue;
+            /* \" \\ \/ 等: 掉到下面取字符本身 */
         }
         if (n + 1 < cap) out[n++] = *p;
         p++;
@@ -2654,7 +2653,7 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
     for (int ci = 0; ci < nch; ci++) {
         int nt = ntok[ci];
         if (nt <= 0) continue;
-        if (verbose || nch > 1) printf("chunk %d/%d: %d tokens\n", ci + 1, nch, nt);
+        if (!g_quiet_gen && (verbose || nch > 1)) printf("chunk %d/%d: %d tokens\n", ci + 1, nch, nt);
 
         /* 上一块循环期间下一块的 prefill 已在后台跑完, 这里通常瞬间取走 */
         GenPre st;
@@ -2703,7 +2702,7 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
             free(pcm);
             continue;
         }
-        printf("  %zu frames -> %.2f s audio  (%llu ms)\n",
+        if (!g_quiet_gen) printf("  %zu frames -> %.2f s audio  (%llu ms)\n",
                frames, (double)nsamp / SAMPLE_RATE, (unsigned long long)(t2 - t1));
 
         size_t pause = 0;
@@ -3093,6 +3092,17 @@ static size_t utf8_clip(const char* s, int maxw)
 static void ui_text(TermUI* u, const char* s)
 {
     if (!u->on || !s[0]) return;
+    char filt[8192];               /* 显示同样滤掉 markdown 装饰符 */
+    {
+        size_t n = 0;
+        for (const char* r = s; *r && n + 1 < sizeof(filt); r++)
+            if (*r != '#' && *r != '*' && *r != '`' && *r != '~' &&
+                *r != '_' && *r != '|')
+                filt[n++] = *r;
+        filt[n] = 0;
+        if (!n) return;
+        s = filt;
+    }
     EnterCriticalSection(&u->cs);
     if (u->active) { fputs("\r\x1b[K", stdout); u->active = 0; }
     fputs(s, stdout);
@@ -3511,6 +3521,16 @@ static void chat_clean_sentence(char* s)
     }
     if (i) memmove(s, s + i, strlen(s + i) + 1);
 
+    /* markdown 装饰符号: 进 TTS 无意义, 就地滤掉 (# * ` ~ _ |) */
+    {
+        char* w = s;
+        for (const char* r = s; *r; r++)
+            if (*r != '#' && *r != '*' && *r != '`' && *r != '~' &&
+                *r != '_' && *r != '|')
+                *w++ = *r;
+        *w = 0;
+    }
+
     /* 剩下的若全是语气词/标点 -> 整句丢弃 */
     size_t j = 0;
     int speech = 0;
@@ -3898,6 +3918,7 @@ int wmain(int argc, wchar_t** argv)
             /* 对话模式: SSE 流式取回回复, 按句切开边收边说 (思维链增量跳过) */
             if (!direct_say && chat_on) {
                 uint64_t tq = now_ms();
+                g_quiet_gen = ui.on;
                 chat_push(&chat, "user", line);
                 char* body = chat_build_body(&chat, 1);
                 SentQ sq;
@@ -3968,6 +3989,7 @@ int wmain(int argc, wchar_t** argv)
                     chat_push(&chat, "assistant", reply);
                 free(reply);
 
+                g_quiet_gen = 0;
                 ui_clear(&ui);
                 if (ts.n > 0)
                     printf("[stats]   : 首句出声 %llu ms | %d 句 | 音频 %.2f s | 本轮 %llu ms\n",
