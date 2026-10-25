@@ -1472,6 +1472,7 @@ typedef struct {
     int      live;
     uint64_t t_first;                     /* 首批音频出声时刻 */
     size_t   emitted;                     /* 本请求实际推给声卡的采样数 */
+    size_t   emitted_total;               /* 设备生命周期累计 (算队列深度用, 不重置) */
     size_t   last_bs[2];                  /* 最近两批的采样数 (自适应扣留) */
     int      nbs;
 } Player;
@@ -1577,7 +1578,8 @@ static size_t player_queue_depth(Player* p)
     memset(&mm, 0, sizeof(mm));
     mm.wType = TIME_SAMPLES;
     if (waveOutGetPosition(p->ho, &mm, sizeof(mm)) != MMSYSERR_NOERROR) return 0;
-    return p->emitted > (size_t)mm.u.sample ? p->emitted - (size_t)mm.u.sample : 0;
+    return p->emitted_total > (size_t)mm.u.sample
+               ? p->emitted_total - (size_t)mm.u.sample : 0;
 }
 
 static void player_push(Player* p, const float* inter, size_t n, double energy)
@@ -1679,6 +1681,7 @@ static void player_emit(Player* p, const float* inter, size_t n)
         off += take;
     }
     p->emitted += n;
+    p->emitted_total += n;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2952,7 +2955,7 @@ static char* chat_reply_text(const char* resp)
 }
 
 /* 组请求体: {"model":"...","input":[{"role":..,"content":..}, ...],"stream":false} */
-static char* chat_build_body(Chat* c)
+static char* chat_build_body(Chat* c, int stream)
 {
     size_t cap = 1 << 16, len = 0;
     char* b = (char*)xmalloc(cap);
@@ -2988,9 +2991,347 @@ static char* chat_build_body(Chat* c)
         BAPPEND(esc);
         BAPPEND("\"}");
     }
-    BAPPEND("],\"stream\":false}");
+    BAPPEND(stream ? "],\"stream\":true}" : "],\"stream\":false}");
 #undef BAPPEND
     return b;
+}
+
+/* ---- SSE 流式对话: 模型边吐答案增量, 按句切开即播 ---- */
+
+/* 一轮对话的累计统计 */
+typedef struct {
+    double   audio_s;      /* 累计音频时长 */
+    uint64_t first_ms;     /* 从提问到首个出声 (0=未出声) */
+    int      n;            /* 已合成句数 */
+} TurnStats;
+
+/* 统一的"朗读一段文本": 归一化 -> (可选)流式播放 -> 编号写盘 -> 记账 */
+static void speak_text(Models* m, SP* sp, const char* text,
+                       const int16_t* ref, size_t ref_frames, uint64_t seed,
+                       int max_frames, int verbose, int use_eos,
+                       Player* pl, int out_given, const wchar_t* out_path,
+                       int* req, TurnStats* ts, uint64_t t0, int quiet)
+{
+    char* norm = normalize_for_tts(text);
+    if (!norm || !norm[0]) { free(norm); return; }
+    uint64_t rq = now_ms();
+    if (pl) player_request(pl);
+    size_t tot = 0;
+    float* audio = synthesize(m, sp, norm, ref, ref_frames, seed, max_frames,
+                              verbose, use_eos, L"", pl, &tot);
+    (*req)++;
+    if (audio) {
+        if (out_given) {
+            wchar_t stem[MAX_PATH * 2], ext[32], cur[MAX_PATH * 2 + 32];
+            wcscpy(stem, out_path);
+            wchar_t* dot = wcsrchr(stem, L'.');
+            if (dot) { wcsncpy(ext, dot, 31); ext[31] = 0; *dot = 0; }
+            else wcscpy(ext, L".wav");
+            _snwprintf(cur, MAX_PATH * 2 + 32, L"%s_%03d%s", stem, *req, ext);
+            wav_write_stereo(cur, audio, tot, CHANNELS, SAMPLE_RATE);
+            char* cu = w2u(cur);
+            printf("wrote     : %s\n", cu ? cu : "?");
+            free(cu);
+        }
+        double as = (double)tot / SAMPLE_RATE;
+        double gs = (double)(now_ms() - rq) / 1000.0;
+        if (ts) {
+            ts->audio_s += as;
+            ts->n++;
+            if (!ts->first_ms && pl && pl->t_first && pl->t_first > t0)
+                ts->first_ms = pl->t_first - t0;
+        }
+        if (!quiet) {
+            if (pl && pl->live)
+                printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f | 播放 %.2f s\n",
+                       (unsigned long long)(pl->t_first ? pl->t_first - rq : 0),
+                       as, gs, as > 0.0 ? gs / as : 0.0,
+                       (double)pl->emitted / SAMPLE_RATE);
+            else
+                printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f\n",
+                       (unsigned long long)(pl->t_first ? pl->t_first - rq : 0),
+                       as, gs, as > 0.0 ? gs / as : 0.0);
+        }
+        free(audio);
+    } else {
+        fprintf(stderr, "  [warn] 没有生成音频\n");
+    }
+    free(norm);
+}
+
+/* 等声卡队列播完 (回提示符前用, 免得"打完字听到的还是上一句的尾巴") */
+static void player_drain(Player* p)
+{
+    if (!p->live) return;
+    for (int t = 0; t < 3000; t++) {
+        int busy = 0;
+        for (int k = 0; k < PL_NBUF; k++)
+            if (p->hdr[k].dwFlags & WHDR_INQUEUE) { busy = 1; break; }
+        if (!busy) break;
+        Sleep(20);
+    }
+}
+
+/* 句子队列: SSE 线程 push, 主线程 pop 即播 */
+typedef struct {
+    CRITICAL_SECTION cs;
+    HANDLE    ev;          /* auto-reset: 有新句或流结束 */
+    char**    q;
+    int       n, cap;
+    int       done;
+} SentQ;
+
+static void sq_init(SentQ* s)
+{
+    memset(s, 0, sizeof(*s));
+    InitializeCriticalSection(&s->cs);
+    s->ev = CreateEvent(NULL, FALSE, FALSE, NULL);
+}
+
+static void sq_free(SentQ* s)
+{
+    DeleteCriticalSection(&s->cs);
+    CloseHandle(s->ev);
+    free(s->q);
+}
+
+static void sq_push(SentQ* s, char* owned)
+{
+    EnterCriticalSection(&s->cs);
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 16;
+        char** nq = (char**)realloc(s->q, sizeof(char*) * (size_t)s->cap);
+        if (!nq) die("out of memory");
+        s->q = nq;
+    }
+    s->q[s->n++] = owned;
+    LeaveCriticalSection(&s->cs);
+    SetEvent(s->ev);
+}
+
+/* 取一句; 队列空且流已结束返回 NULL */
+static char* sq_pop(SentQ* s)
+{
+    for (;;) {
+        EnterCriticalSection(&s->cs);
+        if (s->n > 0) {
+            char* r = s->q[0];
+            memmove(s->q, s->q + 1, sizeof(char*) * (size_t)(s->n - 1));
+            s->n--;
+            LeaveCriticalSection(&s->cs);
+            return r;
+        }
+        int done = s->done;
+        LeaveCriticalSection(&s->cs);
+        if (done) return NULL;
+        WaitForSingleObject(s->ev, 500);
+    }
+}
+
+static void sq_finish(SentQ* s)
+{
+    EnterCriticalSection(&s->cs);
+    s->done = 1;
+    LeaveCriticalSection(&s->cs);
+    SetEvent(s->ev);
+}
+
+/* SSE 流式 POST: 逐行解析事件, 答案增量 (response.output_text.delta 的
+ * "delta" 字段) 通过回调吐出; 思维链增量 (reasoning_summary_text.delta)
+ * 跳过。读到流结束返回 1 (HTTP 层成功与否)。 */
+typedef void (*delta_fn)(void* ctx, const char* delta);
+
+static int chat_post_stream(Chat* c, const char* body, delta_fn cb, void* ctx)
+{
+    DWORD tmo = 120000;
+    HINTERNET net = InternetOpenA("moss_tts", INTERNET_OPEN_TYPE_PRECONFIG,
+                                  NULL, NULL, 0);
+    if (!net) { fprintf(stderr, "  [chat] InternetOpen 失败\n"); return 0; }
+    InternetSetOptionA(net, INTERNET_OPTION_CONNECT_TIMEOUT, &tmo, sizeof(tmo));
+    InternetSetOptionA(net, INTERNET_OPTION_RECEIVE_TIMEOUT, &tmo, sizeof(tmo));
+    InternetSetOptionA(net, INTERNET_OPTION_SEND_TIMEOUT, &tmo, sizeof(tmo));
+
+    HINTERNET conn = InternetConnectA(net, c->host, INTERNET_DEFAULT_HTTPS_PORT,
+                                      NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    HINTERNET req = conn ? HttpOpenRequestA(conn, "POST", c->path, NULL, NULL,
+                                            NULL, INTERNET_FLAG_SECURE |
+                                            INTERNET_FLAG_RELOAD, 0) : NULL;
+    if (!req) {
+        fprintf(stderr, "  [chat] 连不上 %s\n", c->host);
+        if (conn) InternetCloseHandle(conn);
+        InternetCloseHandle(net);
+        return 0;
+    }
+    char hdr[512];
+    snprintf(hdr, sizeof(hdr),
+             "Content-Type: application/json\r\nAuthorization: Bearer %s\r\n",
+             c->key);
+    HttpAddRequestHeadersA(req, hdr, (DWORD)-1L, HTTP_ADDREQ_FLAG_ADD);
+
+    int ok = 0;
+    if (HttpSendRequestA(req, NULL, 0, (void*)body, (DWORD)strlen(body))) {
+        DWORD st = 0, sz = sizeof(st);
+        HttpQueryInfoA(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                       &st, &sz, 0);
+        if (st != 200) {
+            fprintf(stderr, "  [chat] HTTP %lu\n", st);
+        } else {
+            ok = 1;
+            /* 行缓冲: SSE 事件按行分隔, data: 行内是 JSON */
+            char* line = (char*)xmalloc(65536);
+            size_t ln = 0;
+            char chunk[16384];
+            for (;;) {
+                DWORD got = 0;
+                if (!InternetReadFile(req, chunk, sizeof(chunk) - 1, &got))
+                    break;
+                if (!got) break;
+                chunk[got] = 0;
+                for (const char* p = chunk; *p; p++) {
+                    if (*p == '\n' || ln + 2 >= 65536) {
+                        line[ln] = 0;
+                        if (!strncmp(line, "data:", 5)) {
+                            const char* j = line + 5;
+                            while (*j == ' ') j++;
+                            const char* jend = j + strlen(j);
+                            char d[16384];
+                            if (strstr(j, "\"type\":\"response.output_text.delta\"") &&
+                                js_find_str(j, jend, "delta", d, sizeof(d)) && d[0]) {
+                                cb(ctx, d);
+                            }
+                        }
+                        ln = 0;
+                        if (*p != '\n') line[ln++] = *p;
+                    } else {
+                        line[ln++] = *p;
+                    }
+                }
+            }
+            free(line);
+        }
+    } else {
+        fprintf(stderr, "  [chat] 请求发送失败 (%lu)\n", GetLastError());
+    }
+    InternetCloseHandle(req);
+    InternetCloseHandle(conn);
+    InternetCloseHandle(net);
+    return ok;
+}
+
+/* SSE 工作线程上下文 */
+typedef struct {
+    Chat*    c;
+    char*    body;
+    SentQ*   q;
+    CRITICAL_SECTION cs;     /* 保护 full/pend */
+    char*    full;           /* 完整答案 (入对话历史) */
+    size_t   full_n, full_cap;
+    char     pend[16384];    /* 未成句的增量 */
+    size_t   pend_n;
+    int      saw_delta;
+    int      ok;
+} SseJob;
+
+static void sse_append(SseJob* j, const char* s, size_t n)
+{
+    EnterCriticalSection(&j->cs);
+    if (j->full_n + n + 1 > j->full_cap) {
+        size_t nc = j->full_cap ? j->full_cap : 65536;
+        while (nc < j->full_n + n + 1) nc *= 2;
+        char* nb = (char*)realloc(j->full, nc);
+        if (!nb) die("out of memory");
+        j->full = nb;
+        j->full_cap = nc;
+    }
+    memcpy(j->full + j->full_n, s, n);
+    j->full_n += n;
+    j->full[j->full_n] = 0;
+    LeaveCriticalSection(&j->cs);
+}
+
+/* 句末标点: 增量攒够一句就 push 给主线程 */
+static const char* k_sent_enders[] = {
+    "\xe3\x80\x82",          /* 。 */
+    "!", "?", ";",
+    "\xef\xbc\x81",          /* ! */
+    "\xef\xbc\x9f",          /* ? */
+    "\xef\xbc\x9b",          /* ; */
+    "\xe2\x80\xa6",          /* … */
+    "\n",
+};
+
+static void sse_cut_sentences(SseJob* j)
+{
+    for (;;) {
+        const char* best = NULL;
+        size_t best_len = 0;
+        for (size_t e = 0; e < sizeof(k_sent_enders) / sizeof(k_sent_enders[0]); e++) {
+            size_t el = strlen(k_sent_enders[e]);
+            const char* hit = NULL;
+            for (size_t i = 0; i + el <= j->pend_n; i++) {
+                if (!memcmp(j->pend + i, k_sent_enders[e], el)) { hit = j->pend + i; break; }
+            }
+            if (hit && (!best || hit < best)) { best = hit; best_len = el; }
+        }
+        /* 无句末标点但积压太长 (约 300 字节, CJK ~100 字): 强制断句 */
+        if (!best && j->pend_n >= 300) {
+            best = j->pend + 300;
+            best_len = 0;
+        }
+        if (!best) return;
+        size_t cut = (size_t)(best - j->pend) + best_len;
+        if (cut < 2) {                       /* 只剩标点本身, 不成句 */
+            memmove(j->pend, j->pend + cut, j->pend_n - cut);
+            j->pend_n -= cut;
+            continue;
+        }
+        char* sent = (char*)xmalloc(cut + 1);
+        memcpy(sent, j->pend, cut);
+        sent[cut] = 0;
+        memmove(j->pend, j->pend + cut, j->pend_n - cut);
+        j->pend_n -= cut;
+        sq_push(j->q, sent);
+    }
+}
+
+static void on_delta(void* ctx, const char* delta)
+{
+    SseJob* j = (SseJob*)ctx;
+    char d[16384];
+    strncpy(d, delta, sizeof(d) - 1);
+    d[sizeof(d) - 1] = 0;
+    strip_emoji(d);
+    if (!d[0]) return;
+    j->saw_delta = 1;
+    sse_append(j, d, strlen(d));
+    EnterCriticalSection(&j->cs);
+    size_t dl = strlen(d);
+    if (j->pend_n + dl < sizeof(j->pend)) {
+        memcpy(j->pend + j->pend_n, d, dl);
+        j->pend_n += dl;
+        j->pend[j->pend_n] = 0;
+    }
+    LeaveCriticalSection(&j->cs);
+    sse_cut_sentences(j);
+}
+
+static DWORD WINAPI sse_worker(LPVOID p)
+{
+    SseJob* j = (SseJob*)p;
+    j->ok = chat_post_stream(j->c, j->body, on_delta, j);
+    EnterCriticalSection(&j->cs);
+    if (j->pend_n) {
+        j->pend[j->pend_n] = 0;
+        char* tail = _strdup(j->pend);
+        LeaveCriticalSection(&j->cs);
+        strip_emoji(tail);
+        if (tail[strspn(tail, " \t\r")]) sq_push(j->q, tail);
+        else free(tail);
+    } else {
+        LeaveCriticalSection(&j->cs);
+    }
+    sq_finish(j->q);
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -3327,78 +3668,78 @@ int wmain(int argc, wchar_t** argv)
                 }
             }
 
-            /* 朗读对象: 对话模式取大模型回复, /say 或普通模式取原文 */
-            char* speak = line;
-            char* speak_owned = NULL;
+            /* 对话模式: SSE 流式取回回复, 按句切开边收边说 (思维链增量跳过) */
             if (!direct_say && chat_on) {
                 uint64_t tq = now_ms();
                 chat_push(&chat, "user", line);
-                char* body = chat_build_body(&chat);
-                char* resp = chat_post(&chat, body);
-                char* reply = resp ? chat_reply_text(resp) : NULL;
-                free(body);
-                free(resp);
-                if (!reply) {
-                    fprintf(stderr, "  [chat] 没拿到回复, 这句跳过\n");
-                    continue;
-                }
-                printf("AI       : %s  (%llu ms)\n", reply,
-                       (unsigned long long)(now_ms() - tq));
-                strip_emoji(reply);
-                chat_push(&chat, "assistant", reply);
-                speak_owned = reply;
-                speak = reply;
-            }
-            char* lnorm = normalize_for_tts(speak);
-            free(speak_owned);
-            uint64_t rq = now_ms();
-            if (use_player) player_request(&player);
-            size_t tot = 0;
-            float* audio = synthesize(&models, &sp, lnorm, ref, ref_frames, seed,
-                                      max_frames, verbose, !no_eos, L"", pl, &tot);
-            req++;
-            if (audio) {
-                if (out_given) {
-                    /* out.wav -> out_001.wav, out_002.wav ... */
-                    wchar_t stem[MAX_PATH * 2], ext[32], cur[MAX_PATH * 2 + 32];
-                    wcscpy(stem, out_path);
-                    wchar_t* dot = wcsrchr(stem, L'.');
-                    if (dot) { wcsncpy(ext, dot, 31); ext[31] = 0; *dot = 0; }
-                    else wcscpy(ext, L".wav");
-                    _snwprintf(cur, MAX_PATH * 2 + 32, L"%s_%03d%s", stem, req, ext);
-                    wav_write_stereo(cur, audio, tot, CHANNELS, SAMPLE_RATE);
-                    char* cu = w2u(cur);
-                    printf("wrote     : %s\n", cu ? cu : "?");
-                    free(cu);
-                }
-                double as = (double)tot / SAMPLE_RATE;
-                double gs = (double)(now_ms() - rq) / 1000.0;
-                if (player.live)
-                    printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f | 播放 %.2f s\n",
-                           (unsigned long long)(player.t_first ? player.t_first - rq : 0),
-                           as, gs, as > 0.0 ? gs / as : 0.0,
-                           (double)player.emitted / SAMPLE_RATE);
-                else
-                    printf("[stats]   : 首字 %llu ms | 音频 %.2f s | 生成 %.2f s | RTF %.2f\n",
-                           (unsigned long long)(player.t_first ? player.t_first - rq : 0),
-                           as, gs, as > 0.0 ? gs / as : 0.0);
-                free(audio);
-            } else {
-                fprintf(stderr, "  [warn] 没有生成音频\n");
-            }
-            free(lnorm);
+                char* body = chat_build_body(&chat, 1);
+                SentQ sq;
+                sq_init(&sq);
+                SseJob job;
+                memset(&job, 0, sizeof(job));
+                job.c = &chat;
+                job.body = body;
+                job.q = &sq;
+                InitializeCriticalSection(&job.cs);
+                HANDLE th = CreateThread(NULL, 0, sse_worker, &job, 0, NULL);
 
-            /* 等这一段播完再回到提示符: 生成快于播放, 提示符先回来的话,
-             * 用户打下一句时听到的还是上一句的尾巴, 像是内容对不上 */
-            if (player.live) {
-                for (int t = 0; t < 3000; t++) {
-                    int busy = 0;
-                    for (int k = 0; k < PL_NBUF; k++)
-                        if (player.hdr[k].dwFlags & WHDR_INQUEUE) { busy = 1; break; }
-                    if (!busy) break;
-                    Sleep(20);
+                TurnStats ts;
+                memset(&ts, 0, sizeof(ts));
+                for (;;) {
+                    char* s = sq_pop(&sq);
+                    if (!s) break;
+                    if (ts.n == 0)
+                        printf("AI (首句): %s\n", s);
+                    speak_text(&models, &sp, s, ref, ref_frames, seed, max_frames,
+                               verbose, !no_eos, pl, out_given, out_path,
+                               &req, &ts, tq, 1);
+                    free(s);
                 }
+                WaitForSingleObject(th, INFINITE);
+                CloseHandle(th);
+                char* reply = job.full;      /* 完整答案, 入对话历史 */
+                int ok = job.ok;
+                DeleteCriticalSection(&job.cs);
+                sq_free(&sq);
+                free(body);
+
+                /* 一个答案增量都没有 (老网关/被拦): 回退非流式整段 */
+                if (!reply || !reply[0]) {
+                    fprintf(stderr, "  [chat] 流里没有答案增量, 回退非流式\n");
+                    body = chat_build_body(&chat, 0);
+                    char* resp = chat_post(&chat, body);
+                    free(body);
+                    reply = resp ? chat_reply_text(resp) : NULL;
+                    free(resp);
+                    if (reply && reply[0]) {
+                        strip_emoji(reply);
+                        printf("AI       : %s  (%llu ms)\n", reply,
+                               (unsigned long long)(now_ms() - tq));
+                        speak_text(&models, &sp, reply, ref, ref_frames, seed,
+                                   max_frames, verbose, !no_eos, pl, out_given,
+                                   out_path, &req, &ts, tq, 0);
+                    }
+                } else {
+                    printf("AI       : %s  (%llu ms)\n", reply,
+                           (unsigned long long)(now_ms() - tq));
+                }
+
+                if (reply && reply[0])
+                    chat_push(&chat, "assistant", reply);
+                free(reply);
+
+                if (ts.n > 0)
+                    printf("[stats]   : 首句出声 %llu ms | %d 句 | 音频 %.2f s | 本轮 %llu ms\n",
+                           (unsigned long long)ts.first_ms, ts.n, ts.audio_s,
+                           (unsigned long long)(now_ms() - tq));
+                player_drain(&player);
+                continue;
             }
+
+            /* /say 与非对话模式: 直接朗读原文 */
+            speak_text(&models, &sp, line, ref, ref_frames, seed, max_frames,
+                       verbose, !no_eos, pl, out_given, out_path, &req, NULL, 0, 0);
+            player_drain(&player);
         }
         printf("\nserver    : 共 %d 次请求, 退出\n", req);
     } else {
