@@ -49,6 +49,10 @@ none/medium/high` 可调);server 启动时自动预热 ORT 执行计划,首请�
 (`spark-x2.6`,SSE 事件取 `response.output_text.delta`,跳过
 `reasoning_summary_text.delta`;无增量时自动回退非流式)。
 
+终端交互(interactive 终端生效,管道/重定向自动退回纯文本):回复正文
+随模型增量**流式上屏**(打字机效果),底部一行**青色高亮**显示 TTS 正在
+播报的句子(`>> 当前句`),逐句推进、结束后擦除接统计行。
+
 ## 音色
 
 - 18 个官方预置音色(6 中/5 英/7 日)存于 `models/browser_poc_manifest.json`,

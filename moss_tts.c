@@ -3030,6 +3030,103 @@ static char* chat_build_body(Chat* c, int stream)
     return b;
 }
 
+/* ---- 终端流式渲染 (chat 模式): 正文滚动 + 底部"正在播"高亮状态行 ----
+ * VT100 转义 (Win10+ 终端); 状态行单行原地重写, 不做多行重绘 (换行/缩放
+ * 都不会错位); 句子超宽按显示宽度截断 (CJK 算 2)。管道下 ui.on=0 自动
+ * 退回纯文本行为。两个线程 (SSE 收流 / 主线程合成) 经 cs 互斥写终端。 */
+typedef struct {
+    CRITICAL_SECTION cs;
+    int on;      /* 终端支持交互 UI */
+    int active;  /* 状态行当前已显示 */
+} TermUI;
+
+static void ui_init(TermUI* u, int on)
+{
+    memset(u, 0, sizeof(*u));
+    u->on = on;
+    if (on) InitializeCriticalSection(&u->cs);
+}
+
+static int term_width(void)
+{
+    CONSOLE_SCREEN_BUFFER_INFO bi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &bi) &&
+        bi.dwSize.X > 0)
+        return bi.dwSize.X;
+    return 80;
+}
+
+static int disp_w(unsigned cp)
+{
+    if (cp >= 0x1100 && (cp <= 0x115F ||
+        (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xAC00 && cp <= 0xD7A3) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE6F) ||
+        (cp >= 0xFF00 && cp <= 0xFF60) || (cp >= 0xFFE0 && cp <= 0xFFE6)))
+        return 2;
+    return 1;
+}
+
+/* 截 UTF-8 前缀使显示宽度 <= maxw, 返回保留的字节数 */
+static size_t utf8_clip(const char* s, int maxw)
+{
+    size_t i = 0, bytes = 0;
+    int w = 0;
+    while (s[i]) {
+        unsigned char c = (unsigned char)s[i];
+        unsigned cp; size_t n;
+        if (c < 0x80) { cp = c; n = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; n = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; n = 3; }
+        else { cp = c & 0x07; n = 4; }
+        for (size_t k = 1; k < n && s[i + k]; k++)
+            cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+        int cw = disp_w(cp);
+        if (w + cw > maxw) break;
+        w += cw;
+        i += n;
+        bytes = i;
+    }
+    return bytes;
+}
+
+/* 流式正文: 先擦状态行再追加 (打字机效果) */
+static void ui_text(TermUI* u, const char* s)
+{
+    if (!u->on || !s[0]) return;
+    EnterCriticalSection(&u->cs);
+    if (u->active) { fputs("\r\x1b[K", stdout); u->active = 0; }
+    fputs(s, stdout);
+    fflush(stdout);
+    LeaveCriticalSection(&u->cs);
+}
+
+/* 底部状态行: 高亮 TTS 正在处理的句子 */
+static void ui_status(TermUI* u, const char* s)
+{
+    if (!u->on) return;
+    char buf[1024];
+    size_t n = utf8_clip(s, term_width() - 8);
+    if (n > sizeof(buf) - 1) n = sizeof(buf) - 1;
+    memcpy(buf, s, n);
+    buf[n] = 0;
+    EnterCriticalSection(&u->cs);
+    if (u->active) fputs("\r\x1b[K", stdout);
+    else fputc('\n', stdout);
+    fputs("\x1b[1;36m>> ", stdout);
+    fputs(buf, stdout);
+    fputs("\x1b[0m", stdout);
+    fflush(stdout);
+    u->active = 1;
+    LeaveCriticalSection(&u->cs);
+}
+
+static void ui_clear(TermUI* u)
+{
+    if (!u->on) return;
+    EnterCriticalSection(&u->cs);
+    if (u->active) { fputs("\r\x1b[K", stdout); fflush(stdout); u->active = 0; }
+    LeaveCriticalSection(&u->cs);
+}
 /* ---- SSE 流式对话: 模型边吐答案增量, 按句切开即播 ---- */
 
 /* 一轮对话的累计统计 */
@@ -3257,6 +3354,7 @@ typedef struct {
     Chat*    c;
     char*    body;
     SentQ*   q;
+    TermUI*  ui;                     /* 终端流式渲染 (可 NULL) */
     CRITICAL_SECTION cs;     /* 保护 full/pend */
     char*    full;           /* 完整答案 (入对话历史) */
     size_t   full_n, full_cap;
@@ -3337,6 +3435,7 @@ static void on_delta(void* ctx, const char* delta)
     strip_emoji(d);
     if (!d[0]) return;
     j->saw_delta = 1;
+    if (j->ui) ui_text(j->ui, d);
     sse_append(j, d, strlen(d));
     EnterCriticalSection(&j->cs);
     size_t dl = strlen(d);
@@ -3425,6 +3524,7 @@ static void chat_clean_sentence(char* s)
     }
     if (!speech) s[0] = 0;
 }
+
 
 /* ---------------------------------------------------------------------------
  * 8.6 P 核自动钉核
@@ -3515,6 +3615,12 @@ static void usage(void)
 int wmain(int argc, wchar_t** argv)
 {
     SetConsoleOutputCP(CP_UTF8);
+    {   /* VT100 转义 (chat 流式渲染的彩色高亮需要) */
+        DWORD cm = 0;
+        HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (GetConsoleMode(hout, &cm))
+            SetConsoleMode(hout, cm | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
     timeBeginPeriod(1);   /* 默认 15.6ms; 背压/等头的 Sleep(1) 要真睡 1ms */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -3715,12 +3821,16 @@ int wmain(int argc, wchar_t** argv)
             printf("warmup    : %llu ms (首请求不再慢)\n", (unsigned long long)(now_ms() - tw));
         }
         Chat chat;
+        TermUI ui;
+        ui_init(&ui, 0);
         if (chat_on) {
             chat_init(&chat, api_url, api_model, api_key, api_effort);
             if (!chat.key[0]) {
                 fprintf(stderr, "[chat] 缺少 API key (--api-key 或环境变量 CHAT_API_KEY), 对话模式未开启\n");
                 chat_on = 0;
             } else {
+                ui_init(&ui, _isatty(_fileno(stdout)) ||
+                             (getenv("MOSS_FORCE_UI") != NULL));   /* 测试用 */
                 printf("chat      : %s%s (模型 %s); 直接输入对话, /reset 清空, /say <文本> 跳过大模型直接朗读\n",
                        chat.host, chat.path, chat.model);
             }
@@ -3797,6 +3907,7 @@ int wmain(int argc, wchar_t** argv)
                 job.c = &chat;
                 job.body = body;
                 job.q = &sq;
+                job.ui = &ui;
                 InitializeCriticalSection(&job.cs);
                 HANDLE th = CreateThread(NULL, 0, sse_worker, &job, 0, NULL);
 
@@ -3810,8 +3921,9 @@ int wmain(int argc, wchar_t** argv)
                     strncpy(last_spoken, s, sizeof(last_spoken) - 1);
                     last_spoken[sizeof(last_spoken) - 1] = 0;
                     retry_n = 0;
-                    if (ts.n == 0)
+                    if (ts.n == 0 && !ui.on)
                         printf("AI (首句): %s\n", s);
+                    ui_status(&ui, s);
                     speak_text(&models, &sp, s, ref, ref_frames, seed, max_frames,
                                verbose, !no_eos, pl, out_given, out_path,
                                &req, &ts, tq, 1);
@@ -3835,21 +3947,28 @@ int wmain(int argc, wchar_t** argv)
                     free(resp);
                     if (reply && reply[0]) {
                         strip_emoji(reply);
+                        chat_clean_sentence(reply);
                         printf("AI       : %s  (%llu ms)\n", reply,
                                (unsigned long long)(now_ms() - tq));
+                        strncpy(last_spoken, reply, sizeof(last_spoken) - 1);
+                        last_spoken[sizeof(last_spoken) - 1] = 0;
                         speak_text(&models, &sp, reply, ref, ref_frames, seed,
                                    max_frames, verbose, !no_eos, pl, out_given,
                                    out_path, &req, &ts, tq, 0);
                     }
-                } else {
+                } else if (!ui.on) {
+                    ui_clear(&ui);
                     printf("AI       : %s  (%llu ms)\n", reply,
                            (unsigned long long)(now_ms() - tq));
+                } else {
+                    ui_clear(&ui);
                 }
 
                 if (reply && reply[0])
                     chat_push(&chat, "assistant", reply);
                 free(reply);
 
+                ui_clear(&ui);
                 if (ts.n > 0)
                     printf("[stats]   : 首句出声 %llu ms | %d 句 | 音频 %.2f s | 本轮 %llu ms\n",
                            (unsigned long long)ts.first_ms, ts.n, ts.audio_s,

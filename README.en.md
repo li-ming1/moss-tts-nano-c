@@ -61,6 +61,12 @@ xfyun MaaS `/v1/responses` endpoint (`spark-x2.6`, consuming
 `response.output_text.delta` SSE events and skipping
 `reasoning_summary_text.delta`, with a non-streaming fallback).
 
+Terminal interaction (active on an interactive console; pipes fall back to
+plain text): the reply body **streams onto the terminal** as deltas arrive
+(typewriter effect), while a bottom line highlights in **cyan** the sentence
+the TTS is currently speaking (`>> current sentence`), advancing per sentence
+and clearing into the stats line at the end.
+
 ## Voices
 
 - 18 official preset voices (6 Chinese / 5 English / 7 Japanese) live in
