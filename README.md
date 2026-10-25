@@ -11,6 +11,7 @@ build.bat          (需要 MSVC 2022, 产物 moss_tts.exe)
 ```
 
 运行需要 `onnxruntime.dll` 与 `models\`(两个 HF 仓库的 ONNX 导出,见 `.gitignore` 注释)。
+调用方式:**cmd 直接 `moss_tts.exe ...`;PowerShell 必须带路径前缀 `./moss_tts.exe ...`**(裸文件名不在 PATH 里会报"无法识别");git-bash 两者皆可。
 
 ## 快速开始
 
@@ -92,6 +93,14 @@ Intel 混合架构自动钉 P 核、chunk 间 prefill 流水线、播放预缓�
   种子重试;长文本仍可能偶发,属模型能力边界。
 - 跨语言克隆带口音(日语参考说中文等),参考音频决定语气与语速。
 - 克隆真人声音对外发布有授权问题,自行把握。
+
+## 许可证
+
+本项目与所用模型一致,采用 **Apache License 2.0**(见 `LICENSE`;
+模型卡:OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX 与 MOSS-Audio-Tokenizer-Nano-ONNX
+均为 apache-2.0)。依赖的 onnxruntime 为 MIT 许可(不随本仓库分发)。
+注意:许可证覆盖代码与模型,**克隆出的具体人声音色仍受其本人权利约束**,
+对外发布自行把握。
 
 ## 目录
 
