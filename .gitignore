@@ -25,3 +25,12 @@ onnxruntime.dll
 
 # 克隆用的参考音频 (来源素材, 保留在本地不入库)
 *.mp3
+
+# 本地工具/会话状态 (ZCode 工作流与草稿)
+.zcode/
+.workbuddy-ai/
+.vs/
+
+# Windows 杂物
+Thumbs.db
+desktop.ini
