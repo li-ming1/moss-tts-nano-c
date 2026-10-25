@@ -327,6 +327,15 @@ static void sess_open_ex(Session* S, const wchar_t* dir, const wchar_t* file, in
      * 对每步小矩阵是负收益 —— 每帧 52.3 -> 46.5ms (-11%), decode步 -16%。
      * 加载时长与级别无关 (瓶颈在 .data 读取, 试过 .ort 缓存更慢已弃)。
      * 输出与 ALL 逐字节同长, 最大 1 LSB 舍入差, 数值等价。 */
+    /* 试验旋钮 (默认全开, 与历史行为一致): MOSS_NO_ARENA / MOSS_NO_PATTERN */
+    {
+        static int inited = 0;
+        if (!inited) {
+            inited = 1;
+            if (getenv("MOSS_NO_ARENA")) no_arena |= 1;
+            if (getenv("MOSS_NO_PATTERN")) no_arena |= 2;
+        }
+    }
     OK(ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_BASIC));
     OrtStatus* st = ort->CreateSession(g_env, path, so, &S->s);
     ort->ReleaseSessionOptions(so);
