@@ -1,5 +1,7 @@
 # MOSS-TTS-Nano 纯 C 推理
 
+[English](README.en.md) | 中文
+
 [OpenMOSS MOSS-TTS-Nano (0.1B)](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX) 的单文件 C11 推理实现:
 一个翻译单元,只依赖 `onnxruntime.dll`(运行时 LoadLibrary,免导入库)与静态 CRT。
 目标是 Windows CPU 上的准实时流式语音合成。
@@ -93,6 +95,14 @@ Intel 混合架构自动钉 P 核、chunk 间 prefill 流水线、播放预缓�
   种子重试;长文本仍可能偶发,属模型能力边界。
 - 跨语言克隆带口音(日语参考说中文等),参考音频决定语气与语速。
 - 克隆真人声音对外发布有授权问题,自行把握。
+
+## 参考实现与致谢
+
+本 C 实现的流水线结构与关键算法参照了 Rust 参考实现
+[mzdk100/moss-tts-nano](https://github.com/mzdk100/moss-tts-nano)(同为
+Apache-2.0):prompt 组织、帧重复分析判语音结束(其原版 8 帧窗口在本项目
+放宽到 48 帧)、帧生成与 codec 解码交错的流式设计均源于此,并在此基础上
+做了异步流水线、量化与播放工程化。
 
 ## 许可证
 
