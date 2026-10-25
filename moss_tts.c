@@ -1846,11 +1846,21 @@ typedef struct {
     int32_t   past_len;
 } GenPre;
 
-/* 拼 prompt 行并跑 prefill, 产出初始 hidden + KV */
+/* 拼 prompt 行并跑 prefill, 产出初始 hidden + KV。
+ * 互斥: 跨句预取与守护重试可能让两个 prefill 并发, 实测并发会
+ * 堆损坏崩溃 (崩点漂移在 prompt 构建/分词, 典型 corruption 特征),
+ * 串行化后稳定 —— ORT Run 理论线程安全, 触发机理待查, 先保证正确 */
+static CRITICAL_SECTION g_prefill_cs;
+static int g_prefill_cs_init;
 static void gen_prefill(Models* m, const int32_t* text_ids, size_t n_text,
                         const int16_t* ref, size_t ref_frames,
                         int verbose, GenPre* st)
 {
+    if (!g_prefill_cs_init) {
+        InitializeCriticalSection(&g_prefill_cs);
+        g_prefill_cs_init = 1;
+    }
+    EnterCriticalSection(&g_prefill_cs);
     size_t S = (size_t)12 + 1 + ref_frames + 1 + 56 + n_text + 6 + 1;
 
     int32_t* ids = (int32_t*)xmalloc(sizeof(int32_t) * S * ROW_WIDTH);
@@ -1913,6 +1923,7 @@ static void gen_prefill(Models* m, const int32_t* text_ids, size_t n_text,
     ort->ReleaseValue(pin[1]);
     free(ids);
     free(amask);
+    LeaveCriticalSection(&g_prefill_cs);
 }
 
 /* 自回归帧循环 (边生成边解码): 消费并释放 st 的 KV, 返回生成的帧数 */
@@ -2656,11 +2667,11 @@ static int resolve_voice(const wchar_t* manifest_path, const wchar_t* name_w,
 /* 分块合成一段已归一化的文本: 逐块 generate (可选流式播放), 拼接后做
  * 尾部裁剪 + 峰值归一化, 返回整段音频 (调用方 free); *out_total 为采样数。
  * 没生成出任何音频返回 NULL。 */
-static float* synthesize(Models* m, SP* sp, const char* norm,
-                         const int16_t* ref, size_t ref_frames,
-                         uint64_t seed, int max_frames,
-                         int verbose, int use_eos, const wchar_t* dump_frames,
-                         Player* pl, size_t* out_total)
+static float* synthesize2(Models* m, SP* sp, const char* norm,
+                          const int16_t* ref, size_t ref_frames,
+                          uint64_t seed, int max_frames,
+                          int verbose, int use_eos, const wchar_t* dump_frames,
+                          Player* pl, size_t* out_total, GenPre* pre0)
 {
     char** chunks = NULL;
     int nch = split_chunks(sp, norm, &chunks, MAX_TEXT_TOKENS);
@@ -2692,6 +2703,9 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
             hjob = NULL;
             st = job.st;
             /* job.tids 即 tok[ci], 所有权在 tok 表, 循环收尾统一 free (免双重释放) */
+        } else if (pre0) {
+            st = *pre0;            /* 跨句预取命中: 首块免 prefill (kv 归 gen_run) */
+            pre0 = NULL;
         } else {
             gen_prefill(m, tok[ci], (size_t)nt, ref, ref_frames, verbose, &st);
         }
@@ -2813,6 +2827,17 @@ static float* synthesize(Models* m, SP* sp, const char* norm,
 
     *out_total = total_samples;
     return all;
+}
+
+/* 兼容旧签名: 无首块预填 */
+static float* synthesize(Models* m, SP* sp, const char* norm,
+                         const int16_t* ref, size_t ref_frames,
+                         uint64_t seed, int max_frames,
+                         int verbose, int use_eos, const wchar_t* dump_frames,
+                         Player* pl, size_t* out_total)
+{
+    return synthesize2(m, sp, norm, ref, ref_frames, seed, max_frames,
+                       verbose, use_eos, dump_frames, pl, out_total, NULL);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3176,19 +3201,26 @@ typedef struct {
 } TurnStats;
 
 /* 统一的"朗读一段文本": 归一化 -> (可选)流式播放 -> 编号写盘 -> 记账 */
-static void speak_text(Models* m, SP* sp, const char* text,
-                       const int16_t* ref, size_t ref_frames, uint64_t seed,
-                       int max_frames, int verbose, int use_eos,
-                       Player* pl, int out_given, const wchar_t* out_path,
-                       int* req, TurnStats* ts, uint64_t t0, int quiet)
+static void speak_text2(Models* m, SP* sp, const char* text,
+                        const int16_t* ref, size_t ref_frames, uint64_t seed,
+                        int max_frames, int verbose, int use_eos,
+                        Player* pl, int out_given, const wchar_t* out_path,
+                        int* req, TurnStats* ts, uint64_t t0, int quiet, GenPre* pre0)
 {
     char* norm = normalize_for_tts(text);
-    if (!norm || !norm[0]) { free(norm); return; }
+    if (!norm || !norm[0]) {
+        free(norm);
+        if (pre0) {                /* 预取用了却没说话: 释放 KV 防泄漏 */
+            for (int k = 0; k < GLOBAL_LAYERS * 2; k++)
+                if (pre0->kv[k]) ort->ReleaseValue(pre0->kv[k]);
+        }
+        return;
+    }
     uint64_t rq = now_ms();
     if (pl) player_request(pl);
     size_t tot = 0;
-    float* audio = synthesize(m, sp, norm, ref, ref_frames, seed, max_frames,
-                              verbose, use_eos, L"", pl, &tot);
+    float* audio = synthesize2(m, sp, norm, ref, ref_frames, seed, max_frames,
+                               verbose, use_eos, L"", pl, &tot, pre0);
     (*req)++;
     if (audio) {
         if (out_given) {
@@ -3227,6 +3259,17 @@ static void speak_text(Models* m, SP* sp, const char* text,
         fprintf(stderr, "  [warn] 没有生成音频\n");
     }
     free(norm);
+}
+
+/* 兼容旧签名 */
+static void speak_text(Models* m, SP* sp, const char* text,
+                       const int16_t* ref, size_t ref_frames, uint64_t seed,
+                       int max_frames, int verbose, int use_eos,
+                       Player* pl, int out_given, const wchar_t* out_path,
+                       int* req, TurnStats* ts, uint64_t t0, int quiet)
+{
+    speak_text2(m, sp, text, ref, ref_frames, seed, max_frames, verbose,
+                use_eos, pl, out_given, out_path, req, ts, t0, quiet, NULL);
 }
 
 /* 等声卡队列播完 (回提示符前用, 免得"打完字听到的还是上一句的尾巴") */
@@ -3296,6 +3339,20 @@ static char* sq_pop(SentQ* s)
         if (done) return NULL;
         WaitForSingleObject(s->ev, 500);
     }
+}
+
+/* 非阻塞取一句, 没有则 NULL (跨句 prefill 预取用) */
+static char* sq_try_pop(SentQ* s)
+{
+    EnterCriticalSection(&s->cs);
+    char* r = NULL;
+    if (s->n > 0) {
+        r = s->q[0];
+        memmove(s->q, s->q + 1, sizeof(char*) * (size_t)(s->n - 1));
+        s->n--;
+    }
+    LeaveCriticalSection(&s->cs);
+    return r;
 }
 
 static void sq_finish(SentQ* s)
@@ -3487,6 +3544,61 @@ static void on_delta(void* ctx, const char* delta)
     sse_cut_sentences(j);
 }
 
+/* 跨句 prefill 预取: 对话模式句与句之间的 prefill (~0.17s) 是串行死区,
+ * 在上一句生成期间把下一句的首块 prefill 算好 */
+typedef struct {
+    Models* m;
+    SP* sp;
+    char*    text;                  /* 持有所有权, 完成后由主线程 free */
+    const int16_t* ref;
+    size_t   ref_frames;
+    GenPre   pre;
+    int      valid;
+    HANDLE   done;
+} SentPreJob;
+
+static DWORD WINAPI sent_prefill_worker(LPVOID p)
+{
+    SentPreJob* j = (SentPreJob*)p;
+    char* norm = normalize_for_tts(j->text);
+    char** chunks = NULL;
+    int nch = split_chunks(j->sp, norm, &chunks, MAX_TEXT_TOKENS);
+    if (nch > 0 && chunks[0]) {
+        int32_t* tids = (int32_t*)xmalloc(sizeof(int32_t) * (strlen(chunks[0]) * 2 + 16));
+        int nt = sp_encode(j->sp, chunks[0], tids, (int)strlen(chunks[0]) * 2 + 16);
+        if (nt > 0) {
+            gen_prefill(j->m, tids, (size_t)nt, j->ref, j->ref_frames, 0, &j->pre);
+            j->valid = 1;
+        }
+        free(tids);
+    }
+    for (int k = 0; k < nch; k++) free(chunks[k]);
+    free(chunks);
+    free(norm);
+    SetEvent(j->done);
+    return 0;
+}
+
+/* 等待并收走预取结果; 命中返回 GenPre 指针(kv 归调用方), 否则 NULL */
+static GenPre* sent_pre_take(SentPreJob* j, HANDLE* h, const char* expect_text)
+{
+    if (!*h) return NULL;
+    WaitForSingleObject(*h, INFINITE);
+    CloseHandle(*h);
+    *h = NULL;
+    GenPre* r = NULL;
+    if (j->valid && j->text && !strcmp(j->text, expect_text)) r = &j->pre;
+    if (!r && j->valid) {          /* 未命中: 释放 KV 防泄漏 */
+        for (int k = 0; k < GLOBAL_LAYERS * 2; k++)
+            if (j->pre.kv[k]) ort->ReleaseValue(j->pre.kv[k]);
+        j->valid = 0;
+    }
+    /* 注意不 free: j->text 与调用方正在使用的句子缓冲是同一块内存
+     * (窥取别名), 所有权在句循环 -- 这里只清别名防悬挂 */
+    j->text = NULL;
+    return r;
+}
+
 static DWORD WINAPI sse_worker(LPVOID p)
 {
     SseJob* j = (SseJob*)p;
@@ -3623,8 +3735,25 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep)
     char name[MAX_PATH] = "?";
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)addr, &mod) && mod)
         GetModuleFileNameA(mod, name, MAX_PATH);
-    fprintf(stderr, "[crash] code=0x%08lX addr=%p module=%s\n",
-            (unsigned long)ep->ExceptionRecord->ExceptionCode, addr, name);
+    fprintf(stderr, "[crash] code=0x%08lX addr=%p module=%s offset=0x%llX\n",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode, addr, name,
+            mod ? (unsigned long long)((char*)addr - (char*)mod) : 0ull);
+    /* 粗栈回溯: 扫线程栈, 打印落在主模块代码段内的返回地址 */
+    if (mod) {
+        MODULEINFO mi;
+        if (GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) {
+            char* lo = (char*)mod;
+            char* hi = lo + mi.SizeOfImage;
+            uint64_t rsp = ep->ContextRecord->Rsp;
+            fprintf(stderr, "[stack] rsp=%p\n", (void*)rsp);
+            for (int i = 0; i < 512; i++) {
+                char* v = *(char**)(rsp + (uint64_t)i * 8);
+                if (v >= lo + 0x1000 && v < hi)
+                    fprintf(stderr, "  #%d 0x%llX\n", i,
+                            (unsigned long long)(v - lo));
+            }
+        }
+    }
     return EXCEPTION_EXECUTE_HANDLER;
 }
 static void usage(void)
@@ -3963,22 +4092,64 @@ int wmain(int argc, wchar_t** argv)
 
                 TurnStats ts;
                 memset(&ts, 0, sizeof(ts));
+                char* held = NULL;                 /* 预取窥出的下一句 */
+                SentPreJob sjob;
+                memset(&sjob, 0, sizeof(sjob));
+                HANDLE sjob_h = NULL;
                 for (;;) {
-                    char* s = sq_pop(&sq);
+                    char* s = held;
+                    held = NULL;
+                    if (!s) s = sq_pop(&sq);
                     if (!s) break;
+                    /* 先收预取 (含未命中释放), 再清洗 -- 填充词句被跳过也不悬空 */
+                    GenPre* pre0 = sjob_h ? sent_pre_take(&sjob, &sjob_h, s) : NULL;
                     chat_clean_sentence(s);
-                    if (!s[0]) { free(s); continue; }
+                    if (!s[0]) {
+                        free(s);
+                        if (pre0) {
+                            for (int k = 0; k < GLOBAL_LAYERS * 2; k++)
+                                if (pre0->kv[k]) ort->ReleaseValue(pre0->kv[k]);
+                        }
+                        continue;
+                    }
                     strncpy(last_spoken, s, sizeof(last_spoken) - 1);
                     last_spoken[sizeof(last_spoken) - 1] = 0;
                     retry_n = 0;
                     if (ts.n == 0 && !ui.on)
                         printf("AI (首句): %s\n", s);
                     ui_status(&ui, s);
-                    speak_text(&models, &sp, s, ref, ref_frames, seed, max_frames,
-                               verbose, !no_eos, pl, out_given, out_path,
-                               &req, &ts, tq, 1);
+                    speak_text2(&models, &sp, s, ref, ref_frames, seed, max_frames,
+                                verbose, !no_eos, pl, out_given, out_path,
+                                &req, &ts, tq, 1, pre0);
+                    /* 生成期间窥取下一句, 后台预取其首块 prefill。
+                     * 窥取后立刻清洗 -- 预取与合成必须用同一段文本,
+                     * 否则 prefill 的 KV 对应了另一段 prompt */
+                    held = sq_try_pop(&sq);
+                    if (held) {
+                        chat_clean_sentence(held);
+                        if (!held[0]) { free(held); held = NULL; }
+                    }
+                    if (held && getenv("MOSS_SENTPRE") &&
+                        !getenv("MOSS_NO_SENTPRE")) {   /* 默认关: 见提交说明 */
+                        sjob.text = held;
+                        sjob.valid = 0;
+                        sjob.done = CreateEvent(NULL, FALSE, FALSE, NULL);
+                        HANDLE pt = CreateThread(NULL, 0, sent_prefill_worker, &sjob, 0, NULL);
+                        if (pt && sjob.done) {
+                            CloseHandle(pt);
+                            sjob_h = sjob.done;
+                        } else {
+                            if (sjob.done) CloseHandle(sjob.done);
+                            sjob.done = NULL;
+                            sjob.text = NULL;
+                            /* 预取启动失败: held 句下一轮正常走慢路径 */
+                        }
+                    }
                     free(s);
                 }
+                if (sjob_h) sent_pre_take(&sjob, &sjob_h, "");   /* 流结束收尾 */
+                else if (sjob.text) { free(sjob.text); sjob.text = NULL; }
+                if (held) free(held);
                 WaitForSingleObject(th, INFINITE);
                 CloseHandle(th);
                 char* reply = job.full;      /* 完整答案, 入对话历史 */
