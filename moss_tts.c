@@ -1530,12 +1530,16 @@ static void player_begin(Player* p)
 }
 
 /* 新请求边界: 重置首字时刻与预缓冲 (t_first 在 push 时置位, 一次请求内跨 chunk 保持) */
+static size_t player_queue_depth(Player* p);
+
 static void player_request(Player* p)
 {
     p->t_first = 0;
-    p->prebuffering = 1;
     p->pre_n = 0;
     p->emitted = 0;
+    /* 队列里已有余量 (对话模式连播下一句) 就不再攒预缓冲, 句间更连贯;
+     * 冷启动 (深度不足) 才需要开播保护 */
+    p->prebuffering = p->live ? (player_queue_depth(p) < (size_t)(SAMPLE_RATE / 2)) : 1;
     p->nbs = 0;
     p->last_bs[0] = p->last_bs[1] = 0;
 }
@@ -2239,11 +2243,25 @@ static const char* js_read_str(const char* p, const char* end, char* out, int ca
     p++;
     int n = 0;
     while (p < end && *p != '"') {
-        if (*p == '\\' && p + 1 < end) p++;
+        if (*p == '\\' && p + 1 < end) {
+            p++;
+            int esc = 1;                    /* JSON 转义解码 (对话回复里有换行等) */
+            if (*p == 'n') { if (n < cap) out[n++] = '\n'; }
+            else if (*p == 't') { if (n < cap) out[n++] = '\t'; }
+            else if (*p == 'r') { if (n < cap) out[n++] = '\r'; }
+            else if (*p == 'u') {           /* \uXXXX: 模型直接出 UTF-8, 这里兜底 */
+                p++;
+                for (int k = 0; k < 4 && p < end; k++, p++) {}
+                if (n < cap) out[n++] = '?';
+                esc = 0;
+            }
+            if (esc && n < cap) out[n++] = *p;
+            p++;
+            continue;
+        }
         if (n + 1 < cap) out[n++] = *p;
         p++;
     }
-    if (p >= end) return NULL;
     out[n] = 0;
     return p + 1;
 }
@@ -2789,15 +2807,17 @@ typedef struct {
     char    path[160];
     char    model[64];
     char    key[160];
+    char    effort[16];             /* reasoning effort, "none" = 不带 */
 } Chat;
 
 static void chat_init(Chat* c, const wchar_t* api_url, const wchar_t* api_model,
-                      const wchar_t* api_key_w)
+                      const wchar_t* api_key_w, const wchar_t* api_effort)
 {
     memset(c, 0, sizeof(*c));
     strcpy(c->host, "maas-api.cn-huabei-1.xf-yun.com");
     strcpy(c->path, "/v1/responses");
     strcpy(c->model, "spark-x2.6");
+    strcpy(c->effort, "low");       /* 实测 8.4s -> 6.0s, 答案不受影响 */
 
     if (api_url && api_url[0]) {
         char* u = w2u(api_url);
@@ -2820,6 +2840,10 @@ static void chat_init(Chat* c, const wchar_t* api_url, const wchar_t* api_model,
     if (api_model && api_model[0]) {
         char* m = w2u(api_model);
         if (m) { strncpy(c->model, m, sizeof(c->model) - 1); c->model[sizeof(c->model) - 1] = 0; free(m); }
+    }
+    if (api_effort && api_effort[0]) {
+        char* e = w2u(api_effort);
+        if (e) { strncpy(c->effort, e, sizeof(c->effort) - 1); c->effort[sizeof(c->effort) - 1] = 0; free(e); }
     }
     if (api_key_w && api_key_w[0]) {
         char* k = w2u(api_key_w);
@@ -2991,7 +3015,13 @@ static char* chat_build_body(Chat* c, int stream)
         BAPPEND(esc);
         BAPPEND("\"}");
     }
-    BAPPEND(stream ? "],\"stream\":true}" : "],\"stream\":false}");
+    BAPPEND("]");
+    if (strcmp(c->effort, "none")) {
+        BAPPEND(",\"reasoning\":{\"effort\":\"");
+        BAPPEND(c->effort);
+        BAPPEND("\"}");
+    }
+    BAPPEND(stream ? ",\"stream\":true}" : ",\"stream\":false}");
 #undef BAPPEND
     return b;
 }
@@ -3404,6 +3434,7 @@ static void usage(void)
         "  --server            常驻模式: 每行一段文本, 模型只加载一次 (含 --play)\n"
         "  --chat              对话模式 (配合 --server): 输入发给大模型, 回复实时语音播报\n"
         "  --api-key <k>       对话模式密钥 (或环境变量 CHAT_API_KEY)\n"
+        "  --api-effort <s>    推理强度 low/medium/high/none (默认 low, 实测快 ~30%%)\n"
         "  --api-url <u>       对话 API 地址 (默认 xfyun /v1/responses)\n"
         "  --api-model <m>     对话模型 (默认 spark-x2.6)\n"
         "  --no-play           配合 --server: 只合成不播放\n"
@@ -3437,7 +3468,7 @@ int wmain(int argc, wchar_t** argv)
     int max_frames = MAX_FRAMES_DEF;
     int tokens_only = 0, verbose = 0, no_eos = 0, list_voices = 0;
     int play = 0, server = 0, no_play = 0, out_given = 0, fp32 = 0, chat_on = 0;
-    wchar_t api_key[160] = L"", api_url[200] = L"", api_model[64] = L"";
+    wchar_t api_key[160] = L"", api_url[200] = L"", api_model[64] = L"", api_effort[16] = L"";
     const wchar_t* voice_w = L"神里绫华";   /* 默认音色: 用户克隆的音色 */
     wchar_t dump_frames[MAX_PATH] = L"";
     int threads = 0;
@@ -3463,6 +3494,7 @@ int wmain(int argc, wchar_t** argv)
                 else if (!wcscmp(a, L"--fp32")) { fp32 = 1; }
                 else if (!wcscmp(a, L"--chat")) { chat_on = 1; }
                 else if (!wcscmp(a, L"--api-key") && i + 1 < argc) { wcscpy(api_key, argv[++i]); }
+                else if (!wcscmp(a, L"--api-effort") && i + 1 < argc) { wcscpy(api_effort, argv[++i]); }
                 else if (!wcscmp(a, L"--api-url") && i + 1 < argc) { wcscpy(api_url, argv[++i]); }
                 else if (!wcscmp(a, L"--api-model") && i + 1 < argc) { wcscpy(api_model, argv[++i]); }
                 else if (!wcscmp(a, L"--seed") && i + 1 < argc) { seed = _wcstoui64(argv[++i], NULL, 10); }
@@ -3611,9 +3643,18 @@ int wmain(int argc, wchar_t** argv)
         SetConsoleCP(CP_UTF8);        /* 交互终端下让 stdin 按 UTF-8 收 */
         SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
         printf("server    : 每行一段文本回车合成; /voice <名> 换音色, /seed <n> 换种子, /quit 退出\n");
+        /* 预热: ORT 首次 Run 要建执行计划, 不预热的话首请求首字 ~2.6s */
+        {
+            uint64_t tw = now_ms();
+            size_t wu_tot = 0;
+            float* wu = synthesize(&models, &sp, "预热。", ref, ref_frames, seed,
+                                  8, 0, !no_eos, L"", NULL, &wu_tot);
+            free(wu);
+            printf("warmup    : %llu ms (首请求不再慢)\n", (unsigned long long)(now_ms() - tw));
+        }
         Chat chat;
         if (chat_on) {
-            chat_init(&chat, api_url, api_model, api_key);
+            chat_init(&chat, api_url, api_model, api_key, api_effort);
             if (!chat.key[0]) {
                 fprintf(stderr, "[chat] 缺少 API key (--api-key 或环境变量 CHAT_API_KEY), 对话模式未开启\n");
                 chat_on = 0;

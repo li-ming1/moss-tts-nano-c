@@ -38,6 +38,8 @@ AI (首句): 春秋战国时期,各诸侯国为了防御敌国的进攻,纷纷�
 ```
 
 首句出声 = 大模型思考时间 + ~1s(TTS 首字);后句在整轮结束前就已播完大半。
+默认请求带 `reasoning: {"effort": "low"}`(实测思考时间约省 30%,`--api-effort
+none/medium/high` 可调);server 启动时自动预热 ORT 执行计划,首请求不再慢。
 密钥来自 `--api-key` 或环境变量 `CHAT_API_KEY`(不要写进仓库);API 地址与
 模型可用 `--api-url` / `--api-model` 覆盖,默认 xfyun MaaS `/v1/responses`
 (`spark-x2.6`,SSE 事件取 `response.output_text.delta`,跳过
