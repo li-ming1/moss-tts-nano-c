@@ -318,9 +318,11 @@ static void sess_open_ex(Session* S, const wchar_t* dir, const wchar_t* file, in
     OrtSessionOptions* so = NULL;
     OK(ort->CreateSessionOptions(&so));
     OK(ort->SetIntraOpNumThreads(so, threads));
-    /* 关闭自旋等待: 这个模型每步的计算量很小, 自旋线程在混合架构 CPU 上会被
-     * 调度到能效核, 反而拖慢整体 (实测 8 线程: 开启自旋 33s, 关闭后 17.8s)。 */
-    OK(ort->AddSessionConfigEntry(so, "session.intra_op.allow_spinning", "0"));
+    /* 自旋等待: 默认关闭 (混合架构上线程会被调度到能效核, 实测 8 线程
+     * 开自旋 33s vs 关 17.8s)。但进程钉 P 核后该前提可能不成立, 留
+     * MOSS_SPIN=1 试验旋钮复测。 */
+    OK(ort->AddSessionConfigEntry(so, "session.intra_op.allow_spinning",
+                                  getenv("MOSS_SPIN") ? "1" : "0"));
     if (no_arena & 1) OK(ort->DisableCpuMemArena(so));
     if (no_arena & 2) OK(ort->DisableMemPattern(so));
     /* BASIC 而非 ALL: 实测这个规模的图, ALL 级别的额外优化 (布局变换等)
