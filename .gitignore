@@ -11,6 +11,9 @@
 
 # 生成的音频
 *.wav
+# examples/ 下是仓库自带的试听样例(模型克隆音色的实测产物), 需要入库
+!examples/
+!examples/*.wav
 
 # 模型权重与推理运行时（体积太大，需自行下载）
 #   models/           -> OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX
@@ -28,8 +31,6 @@ onnxruntime.dll
 
 # 本地工具/会话状态 (ZCode 工作流与草稿)
 .zcode/
-.workbuddy-ai/
-.vs/
 
 # Windows 杂物
 Thumbs.db

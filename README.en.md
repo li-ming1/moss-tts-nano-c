@@ -84,6 +84,41 @@ and clearing into the stats line at the end.
 moss_tts.exe --ref-wav voice.wav --save-voice MyVoice "A test sentence"
 ```
 
+## Samples (`examples/`)
+
+Everything under `examples/` was produced by this project's model,
+**synthesized from cloned voices — none of it is an original recording**:
+
+| File | Voice source | Content | Length |
+|---|---|---|---|
+| `examples/神里绫华_demo.wav` | built-in preset voice | short demo | 9.8 s |
+| `examples/神里绫华_大模型漫谈.wav` | built-in preset voice | long-form reading | 88.5 s |
+| `examples/哥伦比娅_demo.wav` | cloned via `--ref-wav` | short demo | 8.7 s |
+| `examples/哥伦比娅_大模型发展史.wav` | cloned via `--ref-wav` | long-form reading | 81.9 s |
+
+Reproduce them with:
+
+```
+moss_tts.exe --voice 神里绫华 "text to speak" --out demo.wav
+moss_tts.exe --ref-wav reference.wav "text to speak" --out demo.wav
+```
+
+**How close is it to the original?** The model *learns* the timbre from the
+reference audio; these are not the original voices, and differences are
+inevitable. At 0.1B the model captures the main traits (pitch range, timbre
+tendency, speaking pace) but the details drift: a slight accent, off
+pronunciation, less natural prosody than a human, the occasional timbre
+wobble (more visible over long text), plus the model's own rambling (see
+"Known Limits"). Quantized inference (decode int8 + frame int4) is also not a
+frame-identical rendition of fp32 — with autoregressive sampling every run of
+the same sentence differs, so judge audio quality by ear. In short: these
+samples answer "how far can this small model go", not "is it
+indistinguishable from the real thing".
+
+Voice names in the samples only identify where the reference audio came from;
+the audio itself is synthesized and serves as a technical demo, not for
+commercial use. Get consent before publishing cloned voices (see "License").
+
 ## Performance (i5-1240P, 4 threads, measured)
 
 | Metric | Value |
@@ -126,6 +161,9 @@ prebuffering + silence holding, and guarded generation for short inputs
   seed; long texts may still show it occasionally — a model capability limit.
 - Cross-language cloning carries an accent (a Japanese reference speaking
   Chinese, etc.); the reference audio determines tone and pace.
+- Cloning reproduces the main timbre traits only, so it always differs from
+  the real voice (pronunciation, accent, prosody) — that is the 0.1B ceiling.
+  Long text sounds more "synthetic" than short lines; listen to `examples/`.
 - Publishing cloned voices of real people has consent implications — use
   your own judgement.
 
@@ -152,5 +190,6 @@ and models; **a cloned person's voice remains subject to their own rights**.
 moss_tts.c            the whole implementation (single file)
 build.bat             MSVC build script
 tools/                helper scripts (embedded-data generation, ONNX checks)
+examples/             listening samples (real model output, wav)
 models/               models and manifest (download separately, gitignored)
 ```
